@@ -955,3 +955,241 @@ FMT_OK
 теста работают со строками в памяти. Запись в реестр не производилась.
 `#[allow(...)]` не использован (в том числе и для находки clippy этого
 раунда — она исправлена, не заглушена), `unsafe`-блоков не добавлено.
+
+## Fix round 3
+
+Вердикт был "Needs rework": три находки Important, две — тот же класс
+тихой порчи данных, который раунд 2 должен был закрыть.
+
+### Поправка к раунду 2
+
+Ревью верно указало на неточность в тексте предыдущего раунда: там все
+пять изменённых тестов названы «новых тестов этого раунда» одним списком.
+На деле `an_unbalanced_begin_marker_does_not_truncate_the_profile`
+существовал с раунда 1 и в раунде 2 был расширен (добавлена вторая
+сборка), а не создан заново. Новых тестов было четыре:
+`a_source_that_is_only_a_begin_marker_is_a_fixpoint`,
+`markers_inside_an_inline_block_do_not_delete_its_content`,
+`an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated`,
+`a_tie_between_crlf_and_lf_favours_crlf`. Исправляю здесь явно, текст
+раунда 2 не переписываю (см. правило «дописывать»).
+
+### Что подтвердилось
+
+Ревью независимо пробовало классификатор на полном наборе раскладок
+маркеров — ни одной, только BEGIN, только END, парная пара, два BEGIN
+затем END, BEGIN/END/BEGIN, END раньше BEGIN, вложенные, с комментариями,
+как подстрока, с пробелами, всё то же на CRLF, и целые уже собранные
+профили, поданные заново — и каждая из них оказалась неподвижной точкой
+через три сборки. Эта часть (`normalize_directive` как единственный
+нормализатор для обеих директив, ничья CRLF/LF в пользу CRLF с LF для
+пустого источника, `mask_of` на всех границах, двойная маскировка с обеих
+сторон включая конструирование `Ipv4Net` через публичные поля) подтверждена
+и не трогалась.
+
+### Структурная причина, а не три отдельных бага
+
+Три находки этого раунда — не независимые баги, а один и тот же корень:
+до этой правки в файле было **три независимых классификатора строки**
+(`lines_to_drop` вело собственный учёт inline-блоков; проверка
+`redirect_gateway_present` о них не знала вовсе; `is_inline_block_open` и
+`is_inline_block_close` расходились в требованиях друг с другом), и
+каждое новое требование добавляло четвёртое мнение вместо того, чтобы
+поправить решение в одном месте.
+
+Сделано так, как просило ревью — не патч поверх патча, а одна
+перестройка: `crates/winnet/src/ovpn_profile.rs` теперь строится вокруг
+единственного прохода `classify_lines`, который относит каждую строку
+источника ровно к одному из четырёх [`LineKind`]: `TopLevel`, `Inline`,
+`Begin`, `End`. Всё остальное — `drop_mask` (какие строки вычищаются),
+проверка `redirect_gateway_present`, вычистка `block-outside-dns` —
+потребляет готовую классификацию и не передопрашивает текст. Открывающий
+и закрывающий тег (`inline_tag_open`/`inline_tag_close`) теперь
+симметричны, требуют совпадения имени тега и терпят хвостовой комментарий
+одинаково с обеих сторон.
+
+Незакрытый inline-блок стал явной ошибкой: `build_profile` теперь
+возвращает `Result<String, ProfileError>`, и `ProfileError::UnterminatedInlineBlock
+{ tag, line }` называет тег и номер строки, где он открылся. Единственный
+вызывающий на сегодня — тесты этого модуля; задача 4 будет первым
+настоящим потребителем, задачи 3, 5 и 7 ещё не написаны — дешевле момента
+для смены сигнатуры не будет.
+
+### A. Important — состояние inline-блока протекало за конец файла
+
+Незакрытый `<ca>` держал `in_inline_block` взведённым до EOF, поэтому наш
+же хвостовой блок (всегда в конце файла) становился невидим для
+распознавания маркеров, и каждая следующая сборка дописывала ещё один —
+без предела. Пробник ревью: шесть сборок незакрытого `<ca>` дали
+route-count 6.
+
+Закрыто перестройкой: `classify_lines` возвращает `Err` при незакрытом
+блоке вместо того, чтобы строить что-то похожее на профиль. Тест
+`an_unterminated_inline_block_is_rejected_not_silently_mangled` проверяет
+и текст ошибки (тег `ca`, строка `2`), и
+`repeatedly_building_from_an_unterminated_block_keeps_failing_the_same_way`
+— что повторные попытки не начинают вдруг «собираться» и не ведут себя
+по-разному от вызова к вызову.
+
+### B. Important — открывающая и закрывающая проверки расходились
+
+`is_inline_block_open` (раунд 2) требовала `ends_with('>')`, поэтому
+`<ca> # сертификат` не признавался открытием блока — а `</ca>` блок всё
+равно закрывал. Маркеры между ними считались нашими, и содержимое
+(включая сертификат) вычищалось на первой же сборке. Пробник ревью
+терял `CERT3`.
+
+Закрыто той же перестройкой: `inline_tag_open`/`inline_tag_close`
+симметричны и оба терпят хвостовой контент после имени тега. Тест
+`an_open_tag_with_a_trailing_comment_still_protects_its_contents` — три
+сборки подряд, `CERT3` и сам комментарий после `<ca>` целы на каждой.
+
+### C. Important — проверка «фильтр уже стоит» не знала про inline-блоки
+
+`pull-filter ignore "redirect-gateway"` внутри `<connection>` — валидный
+OpenVPN, но не top-level. Старая проверка сравнивала со всеми уцелевшими
+строками без разбора, поэтому считала фильтр уже присутствующим и не
+добавляла top-level копию — то есть ровно тот отказ, который спека 8.1
+называет причиной существования этой строки: весь трафик уходит в туннель
+кругом через офис, и это устойчивая неподвижная точка, которая сама себя
+не чинит при пересборке.
+
+Закрыто тем же классификатором: `redirect_gateway_present` теперь
+проверяется только по строкам, классифицированным как `TopLevel` — то,
+что лежит внутри `<connection>`, для неё непрозрачно. Тест
+`a_redirect_gateway_filter_inside_a_connection_block_does_not_suppress_the_top_level_one`
+— два прохода, каждый раз ровно два вхождения фильтра (тот, что внутри
+`<connection>`, и наш top-level).
+
+### Метод: классификатор проверен напрямую, не только через build_profile
+
+По совету ревью — `classify_lines` теперь пробуется напрямую, отдельным
+подмодулем `tests::classify`, без смешивания с форматированием вывода и
+списком маршрутов: пустой источник, одинокий `BEGIN`, одинокий `END`,
+пара, два `BEGIN` затем `END`, `BEGIN`/`END`/`BEGIN`, `END` раньше
+`BEGIN`, маркер как подстрока (не распознаётся), маркер с пробелами
+(распознаётся), тег-двойник внутри уже открытого блока (не открывает
+вложенный), открывающий и закрывающий тег с хвостовым комментарием,
+несовпадающий закрывающий тег (блок не закрывается), незакрытый блок
+(ошибка с тегом и строкой), целый уже собранный профиль, поданный заново.
+14 тестов в `ovpn_profile::tests::classify`.
+
+Там, где ошибка не бьёт по одному вызову, тесты гоняют три сборки подряд
+(`build_chain`), не только первую и вторую: `an_unbalanced_begin_marker_does_not_truncate_the_profile`,
+`a_source_that_is_only_a_begin_marker_is_a_fixpoint`,
+`markers_inside_an_inline_block_do_not_delete_its_content`,
+`an_open_tag_with_a_trailing_comment_still_protects_its_contents`,
+`an_inline_block_survives_a_crlf_source_across_three_builds` (тот же
+класс сценариев, но на CRLF-источнике).
+
+### RED-доказательства: находки A/B/C воспроизведены на коде раунда 2
+
+Тот же приём, что и в раундах 1-2, с поправкой: полная перестройка
+сигнатуры (`String` → `Result<String, ProfileError>`) означает, что
+новый набор тестов физически не компилируется поверх старого кода — это
+такой же честный сигнал RED, что и «тип не найден» в самом первом раунде
+задачи, но он не отвечает на вопрос «а действительно ли баги A/B/C —
+баги». Поэтому для этого раунда написаны три отдельных минимальных
+пробника на **собственном API кода раунда 2** (`build_profile(&str, &[Ipv4Net])
+-> String`, без `Result`), подставленных под production-код коммита
+`f448a9c`, прогнанных и затем отброшенных.
+
+Команда: `cargo test -p proxypilot-winnet round3_probes -- --nocapture`
+(production-код `f448a9c` + три пробника):
+
+```
+running 3 tests
+redirect-gateway occurrences: 1
+
+thread 'ovpn_profile::round3_probes::probe_b_open_tag_with_trailing_comment_loses_content' (28248) panicked at crates\winnet\src\ovpn_profile.rs:301:9:
+ОЖИДАНИЕ ОШИБКИ: CERT3 обязан выжить, но раунд 2 его теряет
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'ovpn_profile::round3_probes::probe_c_redirect_gateway_inside_connection_suppresses_top_level_filter' (30244) panicked at crates\winnet\src\ovpn_profile.rs:321:9:
+assertion `left == right` failed: ОЖИДАНИЕ ОШИБКИ: обязано быть 2 (внутри <connection> + наш top-level), раунд 2 добавляет только 0 новых
+  left: 1
+ right: 2
+test ovpn_profile::round3_probes::probe_c_redirect_gateway_inside_connection_suppresses_top_level_filter ... FAILED
+route counts across 6 builds: [1, 2, 3, 4, 5, 6]
+
+thread 'ovpn_profile::round3_probes::probe_a_unterminated_ca_grows_route_count_across_builds' (19612) panicked at crates\winnet\src\ovpn_profile.rs:284:9:
+assertion `left == right` failed: ОЖИДАНИЕ ОШИБКИ: шестая сборка должна была бы тоже дать один маршрут, но раунд 2 копит директивы
+  left: 6
+ right: 1
+test ovpn_profile::round3_probes::probe_b_open_tag_with_trailing_comment_loses_content ... FAILED
+test ovpn_profile::round3_probes::probe_a_unterminated_ca_grows_route_count_across_builds ... FAILED
+
+failures:
+    ovpn_profile::round3_probes::probe_a_unterminated_ca_grows_route_count_across_builds
+    ovpn_profile::round3_probes::probe_b_open_tag_with_trailing_comment_loses_content
+    ovpn_profile::round3_probes::probe_c_redirect_gateway_inside_connection_suppresses_top_level_filter
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p proxypilot-winnet --lib`
+```
+
+Числа совпадают с пробником ревью дословно: route-count `[1, 2, 3, 4, 5,
+6]` через шесть сборок незакрытого `<ca>` (находка A), `CERT3` теряется
+на первой же сборке (находка B), `redirect-gateway` остаётся `1`
+вхождением вместо `2` (находка C). После прогона production-код и тесты
+возвращены к исправленной версии; `diff` подтвердил побайтовое совпадение
+с версией до подстановки.
+
+### CI, три команды — после исправлений раунда 3
+
+#### `cargo test --all`
+
+```
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.60s   (proxypilot-app, bin unittests)
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s    (proxypilot-bridge, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s     (proxypilot-bridge, bin unittests)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s      (proxypilot-bridge, tests/cli.rs)
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s    (proxypilot-core, lib unittests)
+test result: ok. 104 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.13s   (proxypilot-winnet, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s     (doc-tests x3)
+```
+
+Итого: 348 passed, 0 failed, 3 ignored (было 328 после раунда 2; прирост —
+20 тестов в `ovpn_profile` (18 → 38): 14 прямых проб классификатора
+(`tests::classify::*`), плюс
+`a_redirect_gateway_filter_inside_a_connection_block_does_not_suppress_the_top_level_one`,
+`an_open_tag_with_a_trailing_comment_still_protects_its_contents`,
+`an_unterminated_inline_block_is_rejected_not_silently_mangled`,
+`repeatedly_building_from_an_unterminated_block_keeps_failing_the_same_way`,
+`an_inline_block_survives_a_crlf_source_across_three_builds`,
+`а_source_that_is_only_a_begin_marker_is_a_fixpoint` не новый — уже был в
+раунде 2. 328 + 20 = 348, сходится).
+
+#### `cargo clippy --all-targets -- -D warnings`
+
+Первый прогон поймал `useless_format` — тестовый источник без
+интерполяции был обёрнут в `format!()` по инерции от соседних строк с
+`{BEGIN_MARKER}`; заменено на строковый литерал без `#[allow(...)]`.
+Повторный прогон:
+
+```
+    Checking proxypilot-winnet v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\winnet)
+    Checking proxypilot-app v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.66s
+```
+
+Чисто.
+
+#### `cargo fmt --all --check`
+
+Первый прогон нашёл несколько мест, где `cargo fmt` иначе переносит
+длинные цепочки и строковые литералы — `cargo fmt --all` поправил,
+повторный прогон:
+
+```
+FMT_OK
+```
+
+### Границы (подтверждено повторно)
+
+Никакой `openvpn-gui.exe` не запускался. Ни один файл под
+`C:\Program Files\OpenVPN\config\` не читался и не писался — весь раунд
+затронул только `crates/winnet/src/ovpn_profile.rs`, все тесты и пробники
+работают со строками в памяти. Запись в реестр не производилась.
+`#[allow(...)]` не использован (в том числе для находки clippy этого
+раунда — она исправлена, не заглушена), `unsafe`-блоков не добавлено.
