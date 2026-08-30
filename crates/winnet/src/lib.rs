@@ -8,6 +8,7 @@ pub mod autostart;
 pub mod com;
 pub mod events;
 pub mod networks;
+pub mod openvpn;
 pub mod sysproxy;
 
 #[derive(Debug, thiserror::Error)]

@@ -71,8 +71,9 @@
 //!
 //! Обёртка над `HKEY` — `sysproxy::RegKey`, а не своя копия: единственное,
 //! что было жёстко привязано к `Internet Settings`, — подключ в `open()`, и
-//! он вынесен параметром именно ради этого второго потребителя (см. докблок
-//! `sysproxy::RegKey`).
+//! он вынесен параметром именно ради этого второго потребителя. Корень же
+//! (`HKEY_CURRENT_USER`) стал параметром позже, ради третьего потребителя —
+//! `openvpn`, читающего `HKEY_LOCAL_MACHINE` (см. докблок `sysproxy::RegKey`).
 
 use std::env;
 use std::fs;
@@ -82,7 +83,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 #[cfg(feature = "test-registry")]
 use windows::Win32::System::Registry::REG_VALUE_TYPE;
-use windows::Win32::System::Registry::{KEY_READ, KEY_WRITE};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 use crate::sysproxy::RegKey;
 use crate::WinNetError;
@@ -274,7 +275,7 @@ fn points_at(raw: &str, exe: &Path) -> bool {
 /// которым нужен настоящий реестр, но не настоящий `Run`. Продакшн видит
 /// только `is_enabled()` ниже, зашитую на `SUBKEY`.
 fn is_enabled_at(subkey: PCWSTR, exe: &Path) -> Result<bool, WinNetError> {
-    let key = RegKey::open(subkey, KEY_READ)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_READ)?;
     let raw = key.query_string(VALUE_NAME)?;
     Ok(points_at(&expand_env(&raw), exe))
 }
@@ -295,7 +296,7 @@ pub fn is_enabled() -> Result<bool, WinNetError> {
 }
 
 fn enable_at(subkey: PCWSTR, exe: &Path) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)?;
     key.set_string(VALUE_NAME, &quote(exe))
 }
 
@@ -309,7 +310,7 @@ pub fn enable(exe: &Path) -> Result<(), WinNetError> {
 }
 
 fn disable_at(subkey: PCWSTR) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)?;
     key.delete_value(VALUE_NAME)
 }
 
@@ -372,7 +373,7 @@ pub fn restore_raw_value_for_tests(previous: &str, value_type: u32) -> Result<()
 /// вызывающих под фичей.
 #[cfg(feature = "test-registry")]
 fn raw_value_at(subkey: PCWSTR) -> Result<(String, u32), WinNetError> {
-    let key = RegKey::open(subkey, KEY_READ)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_READ)?;
     Ok(match key.query_string_with_type(VALUE_NAME)? {
         Some((ty, value)) => (value, ty.0),
         None => (String::new(), 0),
@@ -385,7 +386,7 @@ fn restore_raw_value_at(
     previous: &str,
     value_type: u32,
 ) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)?;
     if previous.is_empty() {
         key.delete_value(VALUE_NAME)
     } else {
@@ -920,14 +921,16 @@ mod tests {
         let guard = TestSubkeyGuard::new();
         let subkey = guard.subkey();
 
-        let key = RegKey::open(subkey, KEY_WRITE).expect("подключ обязан открываться на запись");
+        let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)
+            .expect("подключ обязан открываться на запись");
         key.set_string_as(VALUE_NAME, r"%SystemRoot%\explorer.exe", REG_EXPAND_SZ)
             .expect("исходное REG_EXPAND_SZ-значение обязано писаться");
 
         let (value, value_type) = raw_value_at(subkey).expect("чтение обязано пройти");
         restore_raw_value_at(subkey, &value, value_type).expect("восстановление обязано пройти");
 
-        let key = RegKey::open(subkey, KEY_READ).expect("подключ обязан открываться на чтение");
+        let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_READ)
+            .expect("подключ обязан открываться на чтение");
         let (restored_type, restored_value) = key
             .query_string_with_type(VALUE_NAME)
             .expect("чтение обязано пройти")

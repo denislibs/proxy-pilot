@@ -81,27 +81,40 @@ pub fn to_bypass_string(no_proxy: &str) -> String {
 /// хендлов. `Drop` закрывает ключ на любом выходе, включая панику.
 ///
 /// `pub(crate)`, а не приватный: тот же тип и приёмы нужны `autostart`
-/// (другой подключ HKCU, `Run` вместо `Internet Settings`) — заводить
+/// (другой подключ HKCU, `Run` вместо `Internet Settings`) и `openvpn`
+/// (другой корень целиком — `HKEY_LOCAL_MACHINE`, только чтение, ключ
+/// `OpenVPN`, который сама Windows не создаёт и не гарантирует) — заводить
 /// вторую байт-в-байт такую же обёртку означало бы копию, которая рано или
-/// поздно разойдётся с этой. `open()` поэтому принимает подключ параметром,
-/// а не хардкодит `SUBKEY` этого модуля — единственное, что было жёстко
-/// привязано к `Internet Settings`.
+/// поздно разойдётся с этой. `open()` поэтому принимает и подключ, и
+/// корень параметрами, а не хардкодит ни `SUBKEY` этого модуля, ни
+/// `HKEY_CURRENT_USER` — то, что раньше было единственным жёстко
+/// привязанным к `Internet Settings`/HKCU, стало параметром ради второго,
+/// а теперь и третьего потребителя.
 pub(crate) struct RegKey(HKEY);
 
 impl RegKey {
-    /// Открывает подключ HKCU с запрошенными правами. Права просим ровно
-    /// те, что нужны: `apply` не должен уметь писать больше, чем пишет,
-    /// а `read` — не должен требовать прав записи вообще.
-    pub(crate) fn open(subkey: PCWSTR, access: REG_SAM_FLAGS) -> Result<Self, WinNetError> {
+    /// Открывает подключ `root` (`HKEY_CURRENT_USER` или
+    /// `HKEY_LOCAL_MACHINE`) с запрошенными правами. Права просим ровно те,
+    /// что нужны: `apply` не должен уметь писать больше, чем пишет, `read`
+    /// и весь `openvpn` — не должны требовать прав записи вообще (чтение
+    /// `HKEY_LOCAL_MACHINE` прав администратора не требует, в отличие от
+    /// записи туда).
+    pub(crate) fn open(
+        root: HKEY,
+        subkey: PCWSTR,
+        access: REG_SAM_FLAGS,
+    ) -> Result<Self, WinNetError> {
         let mut hkey = HKEY::default();
-        // SAFETY: HKEY_CURRENT_USER — предопределённый корень, всегда валиден;
-        // `subkey` обязан быть статической строкой с завершающим нулём (как
-        // `SUBKEY` в этом модуле и в `autostart`, оба заданы через `w!`) —
-        // это контракт параметра, а не то, что проверяется в рантайме;
+        // SAFETY: `root` — один из предопределённых корней реестра
+        // (`HKEY_CURRENT_USER` или `HKEY_LOCAL_MACHINE`), оба всегда валидны
+        // и не нуждаются в закрытии сами по себе; `subkey` обязан быть
+        // статической строкой с завершающим нулём (как `SUBKEY` в этом
+        // модуле, в `autostart` и в `openvpn`, все заданы через `w!`) — это
+        // контракт параметра, а не то, что проверяется в рантайме;
         // `phkresult` указывает на живую локальную переменную, которую API
         // заполняет только при успехе. Полученный хендл сразу переходит под
         // управление RegKey, чей Drop его закрывает.
-        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, access, &mut hkey) }.ok()?;
+        unsafe { RegOpenKeyExW(root, subkey, 0, access, &mut hkey) }.ok()?;
         Ok(Self(hkey))
     }
 
@@ -327,7 +340,7 @@ fn encode_utf16_sz(s: &str) -> Vec<u8> {
 /// Отсутствующее значение — не ошибка: на машине, где прокси никогда не
 /// настраивали, `ProxyServer` просто нет, и это пустая строка.
 pub fn read() -> Result<SysProxy, WinNetError> {
-    let key = RegKey::open(SUBKEY, KEY_READ)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, SUBKEY, KEY_READ)?;
     Ok(SysProxy {
         enabled: key.query_dword(PROXY_ENABLE)? != 0,
         server: key.query_string(PROXY_SERVER)?,
@@ -346,7 +359,7 @@ pub fn read() -> Result<SysProxy, WinNetError> {
 /// сохраняется, тип — нет.
 pub fn apply(p: &SysProxy) -> Result<(), WinNetError> {
     {
-        let key = RegKey::open(SUBKEY, KEY_WRITE)?;
+        let key = RegKey::open(HKEY_CURRENT_USER, SUBKEY, KEY_WRITE)?;
         // Порядок записи не случаен: сначала адрес и исключения, выключатель —
         // последним. Оборвись запись посередине (ключ удалили, политика,
         // квота) — останется выключенный прокси со свежим адресом, безопасная
