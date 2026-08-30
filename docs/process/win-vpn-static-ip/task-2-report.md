@@ -700,3 +700,258 @@ FMT_OK
 `crates/winnet/src/ovpn_profile.rs`, оба теста работают со строками в
 памяти. Запись в реестр не производилась. `#[allow(...)]` не
 использован, `unsafe`-блоков не добавлено.
+
+## Fix round 2
+
+Вердикт был "Needs rework": один Critical, найденный пробником, а не
+чтением, и это находка 1 из раунда 1, вернувшаяся спустя одну сборку.
+
+Что подтвердилось из раунда 1: ревьюер заново независимо проверил
+арифметику и подтвердил, что **обе точки маскировки битов хоста целы и
+реально проверяются** — `route_host_bits_are_masked_even_when_ipv4net_is_built_directly`
+строит `Ipv4Net { addr, prefix }` через публичные поля и проверяет, что
+адрес хоста не попадает в вывод; это было ровно то место, которое легче
+всего тихо схлопнуть обратно к одинарной маскировке, и оно не схлопнулось.
+Идемпотентность держится на LF-источниках, на CRLF-источниках и на
+источниках, уже несущих `pull-filter ignore "redirect-gateway"`. Пункты
+2, 3, 5, 6, 7, 8, 9 раунда 1 закрыты и не переоткрывались.
+
+Ревьюер также независимо реконструировал RED-доказательства раунда 1:
+подставил production-код `91b235d` под тесты раунда 1 и сверил номера
+строк паники, счётчики (core 20/4, winnet 14/7) и конкретное значение
+`left: 203.0.113.5 / right: 0.0.0.0`, которое старый немаскирующий код
+действительно выдаёт. Итог ревьюера: "reads as a real run" — решение
+выбросить придуманный лог и сделать по-честному было верным, а раскрыть
+это — тем более.
+
+### 1. Critical — усечение возвращалось на второй сборке
+
+`matched_generated_block` (раунд 1) спаривала *первый* `BEGIN` с *любым*
+последующим `END`. Непарный `BEGIN` в источнике переживал первую сборку
+как обычная строка — но добавленный этой же сборкой `END` в конце файла
+становился ему парой на **следующей** сборке, и всё между ними (включая
+сертификаты) стиралось. Пробником ревьюера:
+
+```
+A1 keeps CERT-A: true
+A2 keeps CERT-A: false   ← вторая сборка
+```
+
+Опаснее исходного раунд-1-бага по двум причинам: ошибка молчит именно на
+той сборке, что её создаёт (первая выглядит правильной), и задача 5
+пересобирает профиль при каждой смене офисных подсетей — то есть второй
+вызов является обычным ходом дел, а не патологией.
+
+Исправлено в `crates/winnet/src/ovpn_profile.rs`, функция переименована в
+`lines_to_drop`: вместо «найти первый BEGIN + любой следующий END» —
+однопроходный разбор с состоянием `pending_begin`. Каждый маркер, не
+образовавший пару (одинокий `BEGIN` без `END`, одинокий `END` без
+предшествующего `BEGIN`, более ранний `BEGIN`, вытесненный более поздним
+до появления `END`), вычищается **сам, одной строкой**, а не как начало
+диапазона до следующего чужого маркера. Тест
+`an_unbalanced_begin_marker_does_not_truncate_the_profile` расширен именно
+так, как просило ревью — второй вызов `build_profile` над результатом
+первого, с отдельным `assert!` на CERT для каждого прохода. Добавлен и
+отдельный тест на конвергенцию —
+`a_source_that_is_only_a_begin_marker_is_a_fixpoint` (источник — один
+одинокий `BEGIN` без ничего вокруг; `build_profile(build_profile(x)) ==
+build_profile(x)`).
+
+### 2. Important — маркеры внутри inline-блока (`<ca>`) стирали контент
+
+Тот же корень, другой триггер: если `BEGIN`/`END` оказывались внутри
+`<ca>...</ca>`, пара распознавалась и удаляла реальное содержимое
+сертификата между ними, оставляя пустую оболочку из тегов.
+
+`lines_to_drop` теперь отслеживает, находится ли текущая строка внутри
+inline-блока (`is_inline_block_open`/`is_inline_block_close` — строка вида
+`<tag>` / `</tag>`), и **не распознаёт маркеры вовсе**, пока флаг взведён:
+содержимое между открывающим и закрывающим тегом — непрозрачные PEM-данные,
+и наш собственный блок туда никогда не попадает (мы всегда дописываем его
+на верхнем уровне, в конец файла). Тест
+`markers_inside_an_inline_block_do_not_delete_its_content` — маркеры внутри
+`<ca>...</ca>`, проверка на первом и втором проходе (по методическому
+совету ревью — для каждой правки, трогающей маркеры, проверять оба).
+
+### 3. Minor — `redirect_gateway_present` сравнивался буквально
+
+Раунд 1 научил нормализации (схлопывание пробелов, отрезание хвостового
+комментария) только вычистку `block-outside-dns`; проверка «такой
+`pull-filter` уже есть» сравнивала строки через `l.trim() ==` буквально, и
+источник с двойным пробелом получал вторую копию. Вынесена общая
+`normalize_directive`, переиспользуемая и `is_block_outside_dns_directive`,
+и проверкой `redirect_gateway_present` — одна и та же проблема не решается
+дважды по-разному. Тест
+`an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated`.
+
+### 4. Minor — ничья CRLF/LF решалась в пользу LF
+
+`detect_line_ending` требовала строгого большинства (`crlf >
+lf_only`), поэтому один CRLF плюс один голый LF давали ничью 1:1,
+уходившую в LF, — единственная CRLF-строка источника переписывалась.
+Теперь ничья при ненулевом сигнале уходит в CRLF (профиль обычно готовят
+на Windows), а источник вовсе без переносов строк (пустой или
+однострочный) по-прежнему получает `\n` — обе исходные гарантии («пустой
+источник даёт LF», «источник без завершающего переноса получает его»)
+сохранены отдельной веткой на случай `crlf == 0 && lf_only == 0`. Тест
+`a_tie_between_crlf_and_lf_favours_crlf`.
+
+### 5. Minor — источник только из BEGIN не был неподвижной точкой
+
+Прямое следствие Critical — тест `a_source_that_is_only_a_begin_marker_is_a_fixpoint`
+(добавлен для пункта 1 выше) проверяет это напрямую и подтверждён зелёным
+после исправления.
+
+### 6. Ошибка формулировки в CLAUDE.md, не в коде
+
+Правка не в `net.rs` (примеры `10.1.2.3/24` и `10.0.0.0/8` в тестах
+оставлены как есть), а в `CLAUDE.md`, раздел «Данные: репозиторий
+публичный»: буквальное прочтение прежней формулировки запрещало бы
+`192.168.0.0/16` и `10.0.0.0/8` в `DEFAULT_NO_PROXY`
+(`crates/core/src/config.rs`) — то есть рабочее поведение продукта.
+Переформулировано: правило — про утечку данных о реальной инфраструктуре,
+а не про диапазоны как таковые; серые адреса RFC 1918 явно разрешены и как
+продуктовые значения по умолчанию, и как обобщённые примеры в коде и
+тестах. Документационные диапазоны RFC 5737 остаются обязательными только
+там, где нужен пример, изображающий конкретный (вымышленный) внешний адрес.
+
+### Метод: RED для этого раунда — тоже настоящий прогон, не реконструкция
+
+Тот же приём, что и в раунде 1: production-код коммита `2a444a5` (раунд 1)
+подставлен обратно под пять новых тестов этого раунда, прогнан, и только
+после этого файлы возвращены к исправленной версии.
+
+Команда: `cargo test -p proxypilot-winnet ovpn_profile::` (production-код
+`2a444a5` + тесты раунда 2):
+
+```
+running 18 tests
+test ovpn_profile::tests::block_outside_dns_with_a_trailing_comment_is_stripped ... ok
+test ovpn_profile::tests::an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated ... ok
+test ovpn_profile::tests::block_outside_dns_is_stripped ... ok
+test ovpn_profile::tests::block_outside_dns_with_extra_whitespace_is_stripped ... ok
+test ovpn_profile::tests::crlf_source_stays_crlf ... ok
+test ovpn_profile::tests::empty_source_has_no_leading_blank_line ... ok
+test ovpn_profile::tests::building_twice_does_not_duplicate_directives ... ok
+test ovpn_profile::tests::every_route_is_present ... ok
+test ovpn_profile::tests::redirect_gateway_is_filtered ... ok
+test ovpn_profile::tests::empty_routes_still_adds_the_filter ... ok
+test ovpn_profile::tests::pushed_dns_is_not_filtered ... ok
+test ovpn_profile::tests::route_host_bits_are_masked_even_when_ipv4net_is_built_directly ... ok
+test ovpn_profile::tests::markers_inside_an_inline_block_do_not_delete_its_content ... FAILED
+test ovpn_profile::tests::an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated ... FAILED
+test ovpn_profile::tests::a_source_that_is_only_a_begin_marker_is_a_fixpoint ... FAILED
+test ovpn_profile::tests::a_tie_between_crlf_and_lf_favours_crlf ... FAILED
+test ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile ... FAILED
+test ovpn_profile::tests::source_lines_survive ... ok
+
+failures:
+
+---- ovpn_profile::tests::markers_inside_an_inline_block_do_not_delete_its_content stdout ----
+
+thread 'ovpn_profile::tests::markers_inside_an_inline_block_do_not_delete_its_content' (27580) panicked at crates\winnet\src\ovpn_profile.rs:314:9:
+первая сборка потеряла CERT-D
+
+---- ovpn_profile::tests::an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated stdout ----
+
+thread 'ovpn_profile::tests::an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated' (37384) panicked at crates\winnet\src\ovpn_profile.rs:347:9:
+assertion `left == right` failed
+  left: 2
+ right: 1
+
+---- ovpn_profile::tests::a_source_that_is_only_a_begin_marker_is_a_fixpoint stdout ----
+
+thread 'ovpn_profile::tests::a_source_that_is_only_a_begin_marker_is_a_fixpoint' (2252) panicked at crates\winnet\src\ovpn_profile.rs:302:9:
+assertion `left == right` failed
+  left: "# --- ProxyPilot: начало добавленного блока, не редактировать руками ---\n# Сервер обычно пушит маршрут по умолчанию и не пушит маршруты\n# в офисные подсети — без строки ниже весь трафик, включая видео,\n# уходит в туннель кругом через офис (спека 8.1).\npull-filter ignore \"redirect-gateway\"\n# Явные маршруты в офисные подсети. Подсеть, где машина стоит\n# физически, не страдает: её собственная запись в таблице\n# маршрутов точнее любой из этих.\nroute 203.0.113.0 255.255.255.0\nroute 198.51.100.0 255.255.255.0\n# Пушенный DNS осознанно НЕ фильтруется (расхождение с macOS-версией,\n# спека 8.2): туннель нужен ради внутренних имён (git, dev-серверы),\n# а без офисного DNS они не резолвятся. Плата — пока туннель поднят,\n# все DNS-запросы идут в офис; это показывается в UI (задача 7).\n# --- ProxyPilot: конец добавленного блока ---\n"
+ right: "# --- ProxyPilot: начало добавленного блока, не редактировать руками ---\n\n# --- ProxyPilot: начало добавленного блока, не редактировать руками ---\n# Сервер обычно пушит маршрут по умолчанию и не пушит маршруты\n# в офисные подсети — без строки ниже весь трафик, включая видео,\n# уходит в туннель кругом через офис (спека 8.1).\npull-filter ignore \"redirect-gateway\"\n# Явные маршруты в офисные подсети. Подсеть, где машина стоит\n# физически, не страдает: её собственная запись в таблице\n# маршрутов точнее любой из этих.\nroute 203.0.113.0 255.255.255.0\nroute 198.51.100.0 255.255.255.0\n# Пушенный DNS осознанно НЕ фильтруется (расхождение с macOS-версией,\n# спека 8.2): туннель нужен ради внутренних имён (git, dev-серверы),\n# а без офисного DNS они не резолвятся. Плата — пока туннель поднят,\n# все DNS-запросы идут в офис; это показывается в UI (задача 7).\n# --- ProxyPilot: конец добавленного блока ---\n"
+
+---- ovpn_profile::tests::a_tie_between_crlf_and_lf_favours_crlf stdout ----
+
+thread 'ovpn_profile::tests::a_tie_between_crlf_and_lf_favours_crlf' (32036) panicked at crates\winnet\src\ovpn_profile.rs:379:9:
+assertion failed: out.starts_with("client\r\ndev tun\r\n")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile stdout ----
+
+thread 'ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile' (13648) panicked at crates\winnet\src\ovpn_profile.rs:288:9:
+вторая сборка потеряла CERT
+
+
+failures:
+    ovpn_profile::tests::a_source_that_is_only_a_begin_marker_is_a_fixpoint
+    ovpn_profile::tests::a_tie_between_crlf_and_lf_favours_crlf
+    ovpn_profile::tests::an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated
+    ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile
+    ovpn_profile::tests::markers_inside_an_inline_block_do_not_delete_its_content
+
+test result: FAILED. 13 passed; 5 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p proxypilot-winnet --lib`
+```
+
+Пять падений — ровно на замечания Critical (`an_unbalanced_begin_marker...`
+— вторая сборка), пункт 5 (`a_source_that_is_only_a_begin_marker_is_a_fixpoint`),
+Important (`markers_inside_an_inline_block...`), и Minor 3 и 4
+(`an_existing_redirect_gateway_filter_with_odd_whitespace...`,
+`a_tie_between_crlf_and_lf_favours_crlf`). После этого файл возвращён к
+исправленной версии, добавлена вторая (post-fix) сборка в проверке
+inline-блока (по тому же методическому совету), и весь прогон стал
+зелёным.
+
+Один побочный итог самого исправления: `lines_to_drop` изначально писала
+диапазон циклом `for idx in begin..=i { drop[idx] = true; }`, что поймал
+`cargo clippy` (`needless_range_loop`) — переписано на
+`drop.iter_mut().take(i + 1).skip(begin)`, без `#[allow(...)]`.
+
+### CI, три команды — после исправлений раунда 2
+
+#### `cargo test --all`
+
+```
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.58s   (proxypilot-app, bin unittests)
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s    (proxypilot-bridge, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s     (proxypilot-bridge, bin unittests)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s      (proxypilot-bridge, tests/cli.rs)
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s    (proxypilot-core, lib unittests)
+test result: ok. 84 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.13s    (proxypilot-winnet, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 measured; 0 filtered out; finished in 0.00s     (doc-tests x3)
+```
+
+Итого: 328 passed, 0 failed, 3 ignored (было 324 после раунда 1; прирост —
+4 новых теста в `ovpn_profile`:
+`markers_inside_an_inline_block_do_not_delete_its_content`,
+`an_existing_redirect_gateway_filter_with_odd_whitespace_is_not_duplicated`,
+`a_tie_between_crlf_and_lf_favours_crlf`,
+`a_source_that_is_only_a_begin_marker_is_a_fixpoint`; 324 + 4 = 328,
+сходится).
+
+#### `cargo clippy --all-targets -- -D warnings`
+
+Первый прогон после исправления Critical поймал `needless_range_loop`
+(см. выше), исправлено без `#[allow(...)]`. Повторный прогон:
+
+```
+    Checking proxypilot-winnet v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\winnet)
+    Checking proxypilot-app v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.30s
+```
+
+Чисто.
+
+#### `cargo fmt --all --check`
+
+Первый прогон нашёл два места, где `cargo fmt` иначе переносит цепочки
+`.push(...)` — `cargo fmt --all` поправил, повторный прогон:
+
+```
+FMT_OK
+```
+
+### Границы (подтверждено повторно)
+
+Никакой `openvpn-gui.exe` не запускался. Ни один файл под
+`C:\Program Files\OpenVPN\config\` не читался и не писался — правки этого
+раунда затронули `crates/winnet/src/ovpn_profile.rs` и `CLAUDE.md`, оба
+теста работают со строками в памяти. Запись в реестр не производилась.
+`#[allow(...)]` не использован (в том числе и для находки clippy этого
+раунда — она исправлена, не заглушена), `unsafe`-блоков не добавлено.
