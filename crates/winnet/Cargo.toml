@@ -9,6 +9,7 @@ version.workspace = true
 # крейта, поэтому без cfg(windows)-гейта: он был неактивен нигде, кроме
 # как вводил в заблуждение, что крейт умеет собираться и без Windows.
 [dependencies]
+proxypilot-core = { path = "../core" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

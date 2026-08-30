@@ -9,6 +9,7 @@ pub mod com;
 pub mod events;
 pub mod networks;
 pub mod openvpn;
+pub mod ovpn_profile;
 pub mod sysproxy;
 
 #[derive(Debug, thiserror::Error)]

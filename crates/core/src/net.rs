@@ -1,0 +1,151 @@
+//! IPv4-подсеть в нотации CIDR (`10.0.0.0/8`).
+//!
+//! Живёт в `core`, а не в `winnet`, хотя первый потребитель —
+//! split-tunnel профиль OpenVPN (`winnet::ovpn_profile`): тип нужен ещё в
+//! трёх местах (конфиг офисных подсетей, bypass-список моста), он
+//! платформенно-нейтрален — четыре байта и длина префикса, — а `core`
+//! обязан остаться без зависимостей от Windows (CLAUDE.md). Держать его в
+//! `winnet` означало бы тянуть Windows-крейт в `core` ради структуры из
+//! двух полей.
+
+use std::fmt;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Net {
+    pub addr: Ipv4Addr,
+    pub prefix: u8,
+}
+
+/// Маска сети, посчитанная из длины префикса — арифметикой, а не таблицей
+/// «префикс → маска по целым октетам». На macOS-версии такая таблица была
+/// целым классом ошибок: `/14` в ней молча превращался в `/24`, потому что
+/// таблица знала только границы октетов. Здесь такой промежуточной
+/// структуры нет вовсе — посчитать нечего забыть.
+///
+/// `bits` сверх 32 не паникует, а насыщается до 32 (маска на один хост):
+/// сам тип `Ipv4Net` такое значение не пропустит («PrefixTooLarge»), но
+/// функция не обязана разделять с ним предположение о валидности входа.
+pub fn mask_of(bits: u8) -> Ipv4Addr {
+    let bits = bits.min(32);
+    // Сдвиг на 32 — паника в debug-сборке (переполнение сдвига), поэтому
+    // /0 считается отдельно, тем же приёмом, что и в bypass.rs.
+    let mask: u32 = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    Ipv4Addr::from(mask)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Ipv4NetParseError {
+    #[error("нет «/» в «{0}» — формат «адрес/длина-префикса»")]
+    MissingSlash(String),
+    #[error("не разобрался адрес «{0}»")]
+    Addr(String),
+    #[error("не разобралась длина префикса «{0}»")]
+    Prefix(String),
+    #[error("длина префикса {0} больше 32")]
+    PrefixTooLarge(u8),
+}
+
+/// `"10.0.0.0/8"` → `Ipv4Net`. Обратное — `Display` ниже; пара обязана
+/// быть точным round-trip'ом, потому что этим же текстом подсети хранятся
+/// в TOML-конфиге (задача 5).
+impl FromStr for Ipv4Net {
+    type Err = Ipv4NetParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr_s, prefix_s) = s
+            .split_once('/')
+            .ok_or_else(|| Ipv4NetParseError::MissingSlash(s.to_string()))?;
+        let addr = addr_s
+            .parse::<Ipv4Addr>()
+            .map_err(|_| Ipv4NetParseError::Addr(addr_s.to_string()))?;
+        let prefix = prefix_s
+            .parse::<u8>()
+            .map_err(|_| Ipv4NetParseError::Prefix(prefix_s.to_string()))?;
+        if prefix > 32 {
+            return Err(Ipv4NetParseError::PrefixTooLarge(prefix));
+        }
+        Ok(Ipv4Net { addr, prefix })
+    }
+}
+
+impl fmt::Display for Ipv4Net {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_of_zero_is_all_zero() {
+        assert_eq!(mask_of(0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn mask_of_one_bit() {
+        assert_eq!(mask_of(1), Ipv4Addr::new(128, 0, 0, 0));
+    }
+
+    #[test]
+    fn mask_of_eight_bits_is_a_full_octet() {
+        assert_eq!(mask_of(8), Ipv4Addr::new(255, 0, 0, 0));
+    }
+
+    #[test]
+    fn mask_of_fourteen_bits_does_not_round_to_a_full_octet() {
+        // На macOS-версии здесь был класс ошибок: /14 молча превращалось
+        // в /24 из-за таблицы масок по целым октетам.
+        assert_eq!(mask_of(14), Ipv4Addr::new(255, 252, 0, 0));
+    }
+
+    #[test]
+    fn mask_of_twenty_four_bits_is_three_full_octets() {
+        assert_eq!(mask_of(24), Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    #[test]
+    fn mask_of_thirty_one_bits_leaves_a_single_host_bit() {
+        assert_eq!(mask_of(31), Ipv4Addr::new(255, 255, 255, 254));
+    }
+
+    #[test]
+    fn mask_of_thirty_two_bits_is_a_single_host() {
+        assert_eq!(mask_of(32), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn parse_and_display_roundtrip() {
+        let net = Ipv4Net::from_str("10.0.0.0/8").expect("должен разобраться");
+        assert_eq!(net.addr, Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(net.prefix, 8);
+        assert_eq!(net.to_string(), "10.0.0.0/8");
+    }
+
+    #[test]
+    fn parse_rejects_a_prefix_over_thirty_two() {
+        assert!(Ipv4Net::from_str("203.0.113.0/33").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_missing_prefix() {
+        assert!(Ipv4Net::from_str("203.0.113.0").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_non_numeric_prefix() {
+        assert!(Ipv4Net::from_str("203.0.113.0/abc").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_malformed_address() {
+        assert!(Ipv4Net::from_str("not-an-address/8").is_err());
+    }
+}
