@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Тесты и линтеры
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # Те же три команды, что прогоняются локально, дословно. Расхождение
+      # между CI и локальным прогоном даёт зелёную сборку при сломанном коде.
+      - name: Форматирование
+        run: cargo fmt --all --check
+      - name: Клиппи
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Тесты
+        run: cargo test --all
+
+      - name: Сборка релиза
+        run: cargo build --release -p proxypilot-bridge -p proxypilot-app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypilot
+          path: |
+            target/release/proxypilot.exe
+            target/release/proxypilot-bridge.exe
+          retention-days: 14
+
+  msrv:
+    name: Минимальная версия Rust
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Планка проверяется отдельной работой, потому что на свежем toolchain
+      # её нарушение не проявляется вообще: код соберётся у разработчика и
+      # упадёт у того, кто поверил цифре в Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all --all-targets --locked

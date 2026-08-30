@@ -1,0 +1,21 @@
+[package]
+name = "proxypilot-bridge"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "proxypilot-bridge"
+path = "src/main.rs"
+
+[dependencies]
+proxypilot-core = { path = "../core" }
+tokio = { workspace = true }
+arc-swap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }

@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/core", "crates/bridge", "crates/winnet", "crates/app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+# Было 1.75 — ложь: `cargo +1.75.0 check` не собирается вовсе
+# (`time-macros` требует edition2024, то есть Cargo ≥ 1.85), а 1.85.0 не
+# собирается тоже (`time` требует rustc ≥ 1.88.0). Проверено на реальных
+# тулчейнах: 1.75.0 и 1.85.0 отказывают, 1.88.0 — `cargo check --all
+# --all-targets --locked` проходит чисто.
+rust-version = "1.88"
+version = "0.1.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+arc-swap = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+directories = "5"
+tray-icon = "0.24"
+windows = "0.58"
+# Тот же самый крейт, что тянет `windows`; нужен явно, потому что макрос
+# `#[implement]` разворачивается в абсолютные пути `::windows_core::…`.
+windows-core = "0.58"

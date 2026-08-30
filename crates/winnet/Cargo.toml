@@ -1,0 +1,54 @@
+[package]
+name = "proxypilot-winnet"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# Крейт целиком про Windows-API (COM/NLM) и не собирается вне Windows —
+# это не платформенно-опциональная зависимость, а безусловное требование
+# крейта, поэтому без cfg(windows)-гейта: он был неактивен нигде, кроме
+# как вводил в заблуждение, что крейт умеет собираться и без Windows.
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+windows-core = { workspace = true }
+windows = { workspace = true, features = [
+    # `implement` — макрос для COM-приёмника событий NLM.
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Variant",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_WinInet",
+    "Win32_System_Registry",
+    "Win32_System_Environment",
+    # RegCreateKeyExW (тестовая песочница автозапуска) требует SECURITY_ATTRIBUTES.
+    "Win32_Security",
+] }
+
+# Флаг test-registry открывает функции raw_value_for_tests/restore_raw_value_for_tests
+# в autostart.rs — они пишут в реестр произвольную строку без проверок,
+# которых требует enable/disable, и нужны только тестам вне этого крейта,
+# восстанавливающим реальный Run вокруг ignored-тестов. Без флага их не
+# существует в собранном крейте вовсе — не "скрыты", а физически отсутствуют,
+# потому что resolver = "2" (win/Cargo.toml) не унифицирует dev-фичи в сборку
+# продакшн-бинарника.
+[features]
+test-registry = []
+
+# Только для ручной проверки подписки (#[ignore]-тест): показать, что
+# события действительно доходят, можно лишь настоящим логом.
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+# Зависимость крейта от самого себя — обычный приём, чтобы cargo test у
+# этого же крейта унифицировал dev-фичи: `test-registry` иначе включался бы
+# только для внешних потребителей (см. crates/app/Cargo.toml), а собственный
+# ignored-тест round-trip на настоящем Run тоже вызывает
+# raw_value_for_tests/restore_raw_value_for_tests.
+proxypilot-winnet = { path = ".", features = ["test-registry"] }
