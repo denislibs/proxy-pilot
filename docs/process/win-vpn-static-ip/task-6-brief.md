@@ -1,6 +1,6 @@
 # Task 6 — Служба профиля сети
 
-**Files:** `win/crates/netsvc/` (новый крейт-бинарь), `win/Cargo.toml` (члены workspace), `win/crates/app/src/main.rs` (команды `install-service` / `uninstall-service`)
+**Files:** `crates/netsvc/` (новый крейт-бинарь), `win/Cargo.toml` (члены workspace), `crates/app/src/main.rs` (команды `install-service` / `uninstall-service`)
 
 **Produces:** служба Windows `ProxyPilotNetProfile`.
 

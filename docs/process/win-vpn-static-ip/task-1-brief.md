@@ -1,6 +1,6 @@
 # Task 1 — Поиск установленного OpenVPN
 
-**Files:** `win/crates/winnet/src/openvpn.rs` (новый), `win/crates/winnet/src/lib.rs` (дописать модуль по алфавиту)
+**Files:** `crates/winnet/src/openvpn.rs` (новый), `crates/winnet/src/lib.rs` (дописать модуль по алфавиту)
 
 **Produces:**
 ```rust

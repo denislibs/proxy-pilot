@@ -1,6 +1,6 @@
 # Task 5 — Профиль сети: данные и решение
 
-**Files:** `win/crates/core/src/netprofile.rs` (новый), `win/crates/core/src/config.rs`, `win/crates/core/src/lib.rs`
+**Files:** `crates/core/src/netprofile.rs` (новый), `crates/core/src/config.rs`, `crates/core/src/lib.rs`
 
 **Produces:**
 ```rust

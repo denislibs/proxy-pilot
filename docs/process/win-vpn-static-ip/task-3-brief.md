@@ -1,6 +1,6 @@
 # Task 3 — Чужой туннель
 
-**Files:** `win/crates/winnet/src/tunnel_state.rs` (новый), `win/crates/winnet/src/lib.rs`
+**Files:** `crates/winnet/src/tunnel_state.rs` (новый), `crates/winnet/src/lib.rs`
 
 **Produces:**
 ```rust
