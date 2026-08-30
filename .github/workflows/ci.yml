@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Без фильтра по веткам: работа на ветке без проверок означает,
+  # что мы снова копим непроверенное до слияния.
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
