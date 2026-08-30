@@ -21,6 +21,19 @@
 //! `sysproxy`/`autostart`, только с другим корнем (`HKEY_LOCAL_MACHINE`
 //! вместо `HKEY_CURRENT_USER`, ради чего `open()` и получил параметр
 //! `root`): второй путь с сырым `HKEY` здесь не заводится.
+//!
+//! Представление реестра (32- или 64-битное) наследуется от битности
+//! процесса — этот код не просит `KEY_WOW64_64KEY`/`_32KEY` явно. 32-битный
+//! OpenVPN на 64-битной Windows регистрируется под
+//! `HKLM\SOFTWARE\WOW6432Node\OpenVPN` и ставится в `Program Files (x86)`;
+//! ни чтение реестра, ни запасной `%ProgramFiles%`-путь его не найдут. Это
+//! осознанно не исправлено: OpenVPN 2.6+ (актуальная линейка на момент
+//! написания) только 64-битный, свидетельств 32-битной установки у кого-то
+//! из адресатов нет, а отказ здесь безопасен — честное «не установлен»
+//! вместо порчи данных. Если такой отчёт придёт, здесь нужен запасной
+//! `RegKey::open` с `KEY_READ | KEY_WOW64_32KEY` — сама обёртка это уже
+//! умеет через параметр `access`, добавлять для этого нечего, кроме самой
+//! попытки.
 
 use std::path::{Path, PathBuf};
 
@@ -52,7 +65,7 @@ pub struct Installation {
 /// а такой же законный исход, как «установлен».
 pub fn find_installation() -> Result<Option<Installation>, WinNetError> {
     let (bin_dir_value, config_dir_value) = match open_key(SUBKEY)? {
-        Some(key) => (key.query_string(BIN_DIR)?, key.query_string(CONFIG_DIR)?),
+        Some(key) => read_registry_values(&key)?,
         // Ключа нет вовсе — OpenVPN, скорее всего, не ставили. Пустые
         // строки заставляют `locate` ниже взять оба пути из стандартного
         // расположения, а не считать установку найденной по совпадению.
@@ -63,6 +76,20 @@ pub fn find_installation() -> Result<Option<Installation>, WinNetError> {
         &config_dir_value,
         &program_files_dir(),
     ))
+}
+
+/// Читает `bin_dir` и `config_dir` из уже открытого ключа, в этом порядке.
+/// Вынесена отдельной функцией — а не оставлена кортежным выражением прямо
+/// в `find_installation` — специально ради теста
+/// (`find_installation_reads_bin_dir_and_config_dir_into_the_right_slots`),
+/// который ловит случайную перестановку `BIN_DIR`/`CONFIG_DIR` местами. Без
+/// этого разделения перестановку не поймал бы ни один тест: `locate`
+/// тестируется напрямую, с уже верно расставленными аргументами, а живой
+/// смоук на этой машине при перестановке просто получил бы `None` вместо
+/// `Some` (`bin_dir` тогда указывал бы на каталог с конфигурациями, где
+/// `openvpn-gui.exe` нет) и молча прошёл бы — он допускает оба исхода.
+fn read_registry_values(key: &RegKey) -> Result<(String, String), WinNetError> {
+    Ok((key.query_string(BIN_DIR)?, key.query_string(CONFIG_DIR)?))
 }
 
 /// Открывает `HKLM\<subkey>` на чтение; `Ok(None)`, если такого подключа нет
@@ -149,6 +176,104 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_OPTION_NON_VOLATILE,
+    };
+
+    /// Одноразовый подключ HKCU для теста ниже: `find_installation` сама
+    /// читает только `HKLM`, а писать туда этому крейту нельзя ни при каких
+    /// условиях (см. докблок модуля и `CLAUDE.md`) — даже собственный,
+    /// потом же удаляемый подключ. HKCU для тестовой записи можно: тем же
+    /// приёмом уже пользуется `autostart::tests::TestSubkeyGuard`, здесь —
+    /// его младшая копия ровно под то, что нужно `read_registry_values`
+    /// (ей всё равно, из-под какого корня открыт `RegKey` — она лишь читает
+    /// по именам значений).
+    struct ScratchKey {
+        subkey_utf16: Vec<u16>,
+    }
+
+    impl ScratchKey {
+        fn new() -> Self {
+            let name = format!("Software\\ProxyPilotOpenvpnSelfTest-{}", std::process::id());
+            let subkey_utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let subkey_ptr = PCWSTR::from_raw(subkey_utf16.as_ptr());
+
+            let mut hkey = HKEY::default();
+            // SAFETY: HKEY_CURRENT_USER — предопределённый корень, всегда
+            // валиден; `subkey_ptr` указывает на `subkey_utf16` — живой на
+            // весь этот вызов буфер с завершающим нулём; класс и атрибуты
+            // безопасности не нужны — `PCWSTR::null()` и `None`;
+            // `phkresult` указывает на живую локальную переменную, которую
+            // API заполняет только при успехе.
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey_ptr,
+                    0,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE,
+                    None,
+                    &mut hkey,
+                    None,
+                )
+            }
+            .ok()
+            .expect("тестовый подключ обязан создаваться");
+            // SAFETY: хендл только что получен от RegCreateKeyExW и больше
+            // никому не нужен — RegKey::open ниже откроет тот же путь
+            // заново своим собственным хендлом.
+            let _ = unsafe { RegCloseKey(hkey) };
+            Self { subkey_utf16 }
+        }
+
+        fn subkey(&self) -> PCWSTR {
+            PCWSTR::from_raw(self.subkey_utf16.as_ptr())
+        }
+    }
+
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            // SAFETY: HKEY_CURRENT_USER — предопределённый корень;
+            // `self.subkey_utf16` — поле этого же значения, живо до конца
+            // `drop`. Имя несёт PID процесса, поэтому это гарантированно
+            // подключ, созданный `new` этим же прогоном — удаление не
+            // заденет ничьи чужие данные. Ошибку игнорируем сознательно:
+            // падать при уборке за собой хуже, чем оставить пустой подключ.
+            let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, self.subkey()) };
+        }
+    }
+
+    #[test]
+    fn find_installation_reads_bin_dir_and_config_dir_into_the_right_slots() {
+        // Раньше ничего не проверяло порядок: `read_registry_values`
+        // возвращает кортеж `(bin_dir, config_dir)` позиционно, и случайная
+        // перестановка `BIN_DIR`/`CONFIG_DIR` местами не уронила бы ни один
+        // из тестов `locate` (они передают уже правильно расставленные
+        // строки) и не была бы поймана живым смоуком (при перестановке он
+        // просто получил бы `None`, а `None` — допустимый исход и там).
+        // Здесь под собственными именами значений пишутся два заведомо
+        // разных, легко различимых пути, и проверяется, что каждый остался
+        // в своей роли.
+        let scratch = ScratchKey::new();
+        {
+            let key = RegKey::open(HKEY_CURRENT_USER, scratch.subkey(), KEY_WRITE)
+                .expect("тестовый подключ обязан открываться на запись");
+            key.set_string(BIN_DIR, r"C:\ProxyPilotTest\bin-marker")
+                .expect("bin_dir обязан записаться");
+            key.set_string(CONFIG_DIR, r"C:\ProxyPilotTest\config-marker")
+                .expect("config_dir обязан записаться");
+        }
+
+        let key = RegKey::open(HKEY_CURRENT_USER, scratch.subkey(), KEY_READ)
+            .expect("тестовый подключ обязан открываться на чтение");
+        let (bin_dir_value, config_dir_value) =
+            read_registry_values(&key).expect("значения обязаны читаться");
+
+        assert_eq!(bin_dir_value, r"C:\ProxyPilotTest\bin-marker");
+        assert_eq!(config_dir_value, r"C:\ProxyPilotTest\config-marker");
+    }
 
     #[test]
     fn locate_finds_installation_when_registry_bin_dir_has_the_gui_exe() {
@@ -233,7 +358,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[cfg(windows)]
     #[test]
     fn finding_the_real_installation_does_not_fail() {
         // Смоук на живой машине: OpenVPN может быть установлен или нет —
