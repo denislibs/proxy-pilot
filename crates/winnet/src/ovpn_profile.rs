@@ -15,11 +15,15 @@
 //! блок вычищается целиком и пишется заново, поэтому лишний `route` за
 //! подсеть, которую убрали из конфига, не остаётся сиротой навсегда.
 
-use proxypilot_core::net::Ipv4Net;
+use proxypilot_core::net::{mask_of, Ipv4Net};
+use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 
 /// Директива, которую наш клиент печатает как ошибку при каждом старте —
 /// это параметр другой Windows-сборки OpenVPN, не той, что у нас (спека 8.1).
 const BLOCK_OUTSIDE_DNS: &str = "setenv opt block-outside-dns";
+
+const REDIRECT_GATEWAY_FILTER: &str = r#"pull-filter ignore "redirect-gateway""#;
 
 const BEGIN_MARKER: &str =
     "# --- ProxyPilot: начало добавленного блока, не редактировать руками ---";
@@ -36,29 +40,23 @@ const END_MARKER: &str = "# --- ProxyPilot: конец добавленного 
 /// Идемпотентна: повторный вызов над уже собранным профилем (в том числе
 /// с другим набором `routes`) не копит директивы — старый добавленный блок
 /// целиком заменяется новым.
+///
+/// Окончания строк источника (`\n` или `\r\n`) сохраняются: результат не
+/// переписывает файл в стиль, который сам не выбирал.
 pub fn build_profile(source: &str, routes: &[Ipv4Net]) -> String {
-    let mut lines: Vec<&str> = Vec::new();
-    let mut in_generated_block = false;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed == BEGIN_MARKER {
-            in_generated_block = true;
+    let newline = detect_line_ending(source);
+    let raw_lines: Vec<&str> = source.lines().collect();
+    let block_range = matched_generated_block(&raw_lines);
+
+    let mut lines: Vec<&str> = Vec::with_capacity(raw_lines.len());
+    for (i, line) in raw_lines.iter().enumerate() {
+        if block_range.as_ref().is_some_and(|r| r.contains(&i)) {
             continue;
         }
-        if trimmed == END_MARKER {
-            in_generated_block = false;
+        if is_block_outside_dns_directive(line) {
             continue;
         }
-        if in_generated_block {
-            continue;
-        }
-        // Чужой (не наш) артефакт другого Windows-клиента — не то же самое,
-        // что наш блок, поэтому вычищается отдельной проверкой и в любом
-        // месте исходника, а не только внутри маркеров.
-        if trimmed == BLOCK_OUTSIDE_DNS {
-            continue;
-        }
-        lines.push(line);
+        lines.push(*line);
     }
     // Убираем хвостовые пустые строки, оставшиеся после вычистки — иначе
     // каждая пересборка добавляла бы ещё одну пустую строку перед блоком.
@@ -66,47 +64,108 @@ pub fn build_profile(source: &str, routes: &[Ipv4Net]) -> String {
         lines.pop();
     }
 
-    let mut out = lines.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
+    // Если такой фильтр уже стоит вне нашего блока (профиль подготовили
+    // руками), вторая копия в новом блоке ничему не вредит для OpenVPN, но
+    // это ровно та видимая избыточность, от которой должен спасать блок с
+    // маркерами — поэтому не добавляем.
+    let redirect_gateway_present = lines.iter().any(|l| l.trim() == REDIRECT_GATEWAY_FILTER);
+
+    let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
+    // Пустая строка-разделитель нужна только если в источнике вообще что-то
+    // осталось — иначе пустой (или полностью вычищенный) источник получает
+    // добавленный блок с лишней пустой строкой перед ним.
+    if !out_lines.is_empty() {
+        out_lines.push(String::new());
     }
-    out.push('\n');
-    out.push_str(BEGIN_MARKER);
-    out.push('\n');
-    out.push_str(
-        "# Сервер обычно пушит маршрут по умолчанию и не пушит маршруты\n\
-         # в офисные подсети — без строки ниже весь трафик, включая видео,\n\
-         # уходит в туннель кругом через офис (спека 8.1).\n",
-    );
-    out.push_str(r#"pull-filter ignore "redirect-gateway""#);
-    out.push('\n');
-    out.push_str(
-        "# Явные маршруты в офисные подсети. Подсеть, где машина стоит\n\
-         # физически, не страдает: её собственная запись в таблице\n\
-         # маршрутов точнее любой из этих.\n",
-    );
+
+    out_lines.push(BEGIN_MARKER.to_string());
+    if !redirect_gateway_present {
+        out_lines
+            .push("# Сервер обычно пушит маршрут по умолчанию и не пушит маршруты".to_string());
+        out_lines
+            .push("# в офисные подсети — без строки ниже весь трафик, включая видео,".to_string());
+        out_lines.push("# уходит в туннель кругом через офис (спека 8.1).".to_string());
+        out_lines.push(REDIRECT_GATEWAY_FILTER.to_string());
+    }
+    out_lines.push("# Явные маршруты в офисные подсети. Подсеть, где машина стоит".to_string());
+    out_lines.push("# физически, не страдает: её собственная запись в таблице".to_string());
+    out_lines.push("# маршрутов точнее любой из этих.".to_string());
     for route in routes {
-        out.push_str(&format!(
-            "route {} {}\n",
-            route.addr,
-            proxypilot_core::net::mask_of(route.prefix)
+        out_lines.push(format!(
+            "route {} {}",
+            masked_addr(route),
+            mask_of(route.prefix)
         ));
     }
-    out.push_str(
-        "# Пушенный DNS осознанно НЕ фильтруется (расхождение с macOS-версией,\n\
-         # спека 8.2): туннель нужен ради внутренних имён (git, dev-серверы),\n\
-         # а без офисного DNS они не резолвятся. Плата — пока туннель поднят,\n\
-         # все DNS-запросы идут в офис; это показывается в UI (задача 7).\n",
-    );
-    out.push_str(END_MARKER);
-    out.push('\n');
+    out_lines
+        .push("# Пушенный DNS осознанно НЕ фильтруется (расхождение с macOS-версией,".to_string());
+    out_lines
+        .push("# спека 8.2): туннель нужен ради внутренних имён (git, dev-серверы),".to_string());
+    out_lines
+        .push("# а без офисного DNS они не резолвятся. Плата — пока туннель поднят,".to_string());
+    out_lines.push("# все DNS-запросы идут в офис; это показывается в UI (задача 7).".to_string());
+    out_lines.push(END_MARKER.to_string());
+
+    let mut out = out_lines.join(newline);
+    out.push_str(newline);
     out
+}
+
+/// Границы уже собранного нами блока — пара маркеров, где конец идёт
+/// строго после начала. Без пары (маркеров нет вовсе, или в источнике
+/// одинокий `BEGIN` без `END` — обрезанный или вручную подправленный
+/// прошлый результат) трогать нечего: считать всё после одинокого `BEGIN`
+/// «нашим блоком» стёрло бы весь хвост исходника, вплоть до сертификатов.
+fn matched_generated_block(raw_lines: &[&str]) -> Option<RangeInclusive<usize>> {
+    let begin = raw_lines.iter().position(|l| l.trim() == BEGIN_MARKER)?;
+    let end_offset = raw_lines[begin + 1..]
+        .iter()
+        .position(|l| l.trim() == END_MARKER)?;
+    Some(begin..=(begin + 1 + end_offset))
+}
+
+/// `true`, если строка — директива `setenv opt block-outside-dns`, пусть
+/// даже с необычными пробелами (`setenv  opt  block-outside-dns`) или
+/// хвостовым комментарием (`setenv opt block-outside-dns # заметка`) —
+/// обе формы синтаксически валидны для OpenVPN так же, как каноническая
+/// запись, и обязаны вычищаться одинаково.
+fn is_block_outside_dns_directive(line: &str) -> bool {
+    let without_comment = line.split(['#', ';']).next().unwrap_or("");
+    without_comment
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        == BLOCK_OUTSIDE_DNS
+}
+
+/// Маска считается заново, а не берётся из уже промаскированного
+/// `Ipv4Net::from_str` — потому что поля `Ipv4Net` публичны, и этот
+/// конструктор (`Ipv4Net { addr, prefix }` напрямую) можно обойти. Задачи
+/// 3, 5 и 7 будут собирать такие значения не только через `FromStr`. Это не
+/// дублирование маскировки в `core::net::Ipv4Net::from_str` — это два
+/// разных места, куда адрес с битами хоста может прийти, и каждое обязано
+/// защищаться само, независимо от другого.
+fn masked_addr(net: &Ipv4Net) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(net.addr) & u32::from(mask_of(net.prefix)))
+}
+
+/// `\r\n`, если в источнике преобладают строки с `\r\n` (типичный случай
+/// для профиля, сохранённого на Windows), иначе `\n`. Решает большинство,
+/// а не первая встреченная строка — иначе один случайно вставленный перенос
+/// другого стиля решал бы за весь файл.
+fn detect_line_ending(source: &str) -> &'static str {
+    let crlf = source.matches("\r\n").count();
+    let all_newlines = source.matches('\n').count();
+    if crlf > all_newlines.saturating_sub(crlf) {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proxypilot_core::net::Ipv4Net;
     use std::str::FromStr;
 
     // RFC 5737 — документационные диапазоны, никаких реальных офисных
@@ -163,6 +222,26 @@ setenv opt block-outside-dns
     }
 
     #[test]
+    fn block_outside_dns_with_extra_whitespace_is_stripped() {
+        let source = SOURCE.replace(
+            "setenv opt block-outside-dns",
+            "setenv  opt   block-outside-dns",
+        );
+        let out = build_profile(&source, &routes());
+        assert!(!out.contains("block-outside-dns"));
+    }
+
+    #[test]
+    fn block_outside_dns_with_a_trailing_comment_is_stripped() {
+        let source = SOURCE.replace(
+            "setenv opt block-outside-dns",
+            "setenv opt block-outside-dns # не наше, но клиент ругается",
+        );
+        let out = build_profile(&source, &routes());
+        assert!(!out.contains("block-outside-dns"));
+    }
+
+    #[test]
     fn pushed_dns_is_not_filtered() {
         // Осознанное расхождение с macOS-версией (спека 8.2): пушенный
         // DNS принимаем, иначе внутренние имена не резолвятся.
@@ -188,5 +267,57 @@ setenv opt block-outside-dns
     fn empty_routes_still_adds_the_filter() {
         let out = build_profile(SOURCE, &[]);
         assert!(out.contains(r#"pull-filter ignore "redirect-gateway""#));
+    }
+
+    #[test]
+    fn an_unbalanced_begin_marker_does_not_truncate_the_profile() {
+        // Обрезанный (или вручную подправленный) прошлый результат: BEGIN
+        // есть, END потерялся. Раньше это стирало всё до конца файла,
+        // сертификат включительно.
+        let source = format!("client\n{BEGIN_MARKER}\n<ca>\nCERT\n</ca>\n");
+        let out = build_profile(&source, &routes());
+        assert!(out.contains("CERT"));
+        assert!(out.contains("<ca>"));
+        assert!(out.contains("</ca>"));
+    }
+
+    #[test]
+    fn an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated() {
+        let source = format!("{SOURCE}pull-filter ignore \"redirect-gateway\"\n");
+        let out = build_profile(&source, &routes());
+        assert_eq!(
+            out.matches(r#"pull-filter ignore "redirect-gateway""#)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn route_host_bits_are_masked_even_when_ipv4net_is_built_directly() {
+        // В обход FromStr (который уже маскирует сам) — напрямую через
+        // публичные поля, как это потенциально сделают задачи 3/5/7.
+        let route = Ipv4Net {
+            addr: "203.0.113.5".parse().unwrap(),
+            prefix: 24,
+        };
+        let out = build_profile(SOURCE, &[route]);
+        assert!(out.contains("route 203.0.113.0 255.255.255.0"));
+        assert!(!out.contains("203.0.113.5"));
+    }
+
+    #[test]
+    fn crlf_source_stays_crlf() {
+        let source = SOURCE.replace('\n', "\r\n");
+        let out = build_profile(&source, &routes());
+        assert!(out.contains("client\r\ndev tun"));
+        // Каждый перенос строки в результате — именно CRLF, а не голый LF:
+        // число "\n" совпадает с числом "\r\n".
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count());
+    }
+
+    #[test]
+    fn empty_source_has_no_leading_blank_line() {
+        let out = build_profile("", &routes());
+        assert!(out.starts_with(BEGIN_MARKER));
     }
 }

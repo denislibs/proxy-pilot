@@ -374,3 +374,329 @@ FMT_OK
 это решение сочтут неверным — правка небольшая: заменить вычистку по
 маркерам на построчную дедупликацию, тесты акцептанса это не различают
 (они гоняют с одинаковым списком `routes` на обоих вызовах).
+
+## Fix round 1
+
+Ревьюер собрал отдельный пробный крейт вне репозитория с `#[path]`-инклудом
+настоящего `ovpn_profile.rs` и независимо проверил арифметику, а не
+поверил тестам: `mask_of` подтверждена на `/0 /1 /8 /14 /24 /31 /32`, `/0`
+не паникует в debug, `FromStr` отклоняет `/33`, отсутствующий префикс,
+нечисловой, пробелы, пять октетов, `/256`, `/8/9`. `core` не приобрёл
+платформенных зависимостей. TDD-логи сверены построчно и признаны
+подлинными. Marker-block решение признано верным и разрешающим напряжение
+между «вычистить» и «сохранить»: `block-outside-dns` вычищается по
+строкам вне блока, поэтому пересборка над уже собранным результатом —
+неподвижная точка, а пользователь, вручную вернувший эту директиву в
+исходник, получает её вычищенной заново.
+
+Найдено 9 замечаний, все исправлены на коммите `91b235d`. Правки — в тех
+же файлах: `crates/core/src/net.rs`, `crates/winnet/src/ovpn_profile.rs`.
+
+### 1. Important — несбалансированный BEGIN обрезал профиль
+
+`in_generated_block` раньше не имел «отката»: одинокий `BEGIN` без `END`
+(обрезанный или вручную подправленный прошлый результат) включал вычистку
+до конца файла, сертификаты включительно. Исправлено — `matched_generated_block`
+(`ovpn_profile.rs`) ищет пару `BEGIN`+`END`, где `END` строго после
+`BEGIN`, и вычищает диапазон только при найденной паре; без пары маркеры
+не трогаются вовсе, они остаются обычными строками (для OpenVPN это
+безвредный комментарий, начинающийся с `#`). Тест
+`an_unbalanced_begin_marker_does_not_truncate_the_profile` гоняет источник
+с одиноким `BEGIN_MARKER` перед сертификатом и проверяет, что сертификат
+остался.
+
+### 2. Important — биты хоста не маскировались
+
+Исправлено в обоих местах, как и требовалось, — и обе правки остаются
+намеренно, не как дублирование:
+
+- `Ipv4Net::from_str` (`net.rs`) теперь маскирует адрес по вычисленной
+  маске сразу при разборе — одно каноническое представление на подсеть.
+  Тест `parse_masks_host_bits`: `"10.1.2.3/24"` → `addr = 10.1.2.0`,
+  `to_string() == "10.1.2.0/24"`.
+- `build_profile` (`ovpn_profile.rs`) маскирует адрес заново при
+  формировании `route`, функцией `masked_addr` — потому что поля
+  `Ipv4Net` публичны и конструктор в обход `FromStr`
+  (`Ipv4Net { addr, prefix }` напрямую) эту маскировку не проходит; задачи
+  3, 5, 7 будут собирать такие значения не только через `FromStr`.
+  Doc-комментарий над `masked_addr` в коде явно называет причину
+  сохранять обе точки защиты. Тест
+  `route_host_bits_are_masked_even_when_ipv4net_is_built_directly`
+  строит `Ipv4Net { addr: "203.0.113.5".parse().unwrap(), prefix: 24 }`
+  напрямую (в обход `FromStr`) и проверяет, что в `route` попал
+  `203.0.113.0`, а не `.5`.
+
+### 3. Minor — вычистка `block-outside-dns` по точному совпадению строки
+
+`is_block_outside_dns_directive` (`ovpn_profile.rs`) теперь отрезает
+хвостовой комментарий (после `#` или `;`) и схлопывает повторяющиеся
+пробелы перед сравнением с канонической директивой. Тесты
+`block_outside_dns_with_extra_whitespace_is_stripped` (двойные пробелы) и
+`block_outside_dns_with_a_trailing_comment_is_stripped` (директива с
+`# заметка` после неё).
+
+### 4. Minor — дублирование `pull-filter`, уже стоящего вне блока
+
+`build_profile` перед формированием нового блока проверяет, есть ли
+`pull-filter ignore "redirect-gateway"` уже среди уцелевших строк
+источника (`redirect_gateway_present`); если да — не добавляет ни
+объясняющий комментарий, ни саму директиву повторно. Тест
+`an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated`.
+
+### 5. Minor — CRLF источника превращался в LF
+
+`detect_line_ending` (`ovpn_profile.rs`) считает, каких переносов строк в
+источнике больше — `\r\n` или голых `\n` — и результат собирается тем же
+переносом. Решает большинство, а не первая встреченная строка, чтобы один
+случайный перенос другого стиля не решал за весь файл. Тест
+`crlf_source_stays_crlf`: источник целиком на `\r\n`, проверяется, что в
+результате число `"\n"` совпадает с числом `"\r\n"` (то есть голых `\n`
+нет вовсе).
+
+### 6-7. Minor — `net.rs` принимал `+8` и `/08`; пустой источник получал
+### лишнюю пустую строку
+
+`parse_prefix` (`net.rs`) требует, чтобы длина префикса состояла только
+из ASCII-цифр и не начиналась с `0` при длине больше одного знака —
+отклоняет `+8` (не цифра) и `08` (не канонический вид), при этом `"0"`
+по-прежнему принимается. Тесты `parse_rejects_a_leading_plus_prefix`,
+`parse_rejects_a_leading_zero_prefix`, `parse_accepts_a_bare_zero_prefix`.
+
+В `build_profile` пустая строка-разделитель перед добавленным блоком
+теперь пишется, только если после вычистки источника осталась хоть одна
+строка (`if !out_lines.is_empty()`). Тест
+`empty_source_has_no_leading_blank_line`: `build_profile("", &routes())`
+начинается сразу с `BEGIN_MARKER`.
+
+### 8. Minor — `Cargo.lock` v3→v4
+
+Разобрано: добавление зависимости `proxypilot-core = { path = "../core" }`
+в `crates/winnet/Cargo.toml` заставило cargo 1.98 перезаписать
+`Cargo.lock`, и cargo при перезаписи поднял формат файла с `version = 3`
+на `version = 4` — это самостоятельное решение тулчейна при любом
+touch-е файла, не ручная правка. В этом раунде исправлений `Cargo.lock` не
+менялся вовсе (новых зависимостей не добавлялось) — `git diff --stat
+Cargo.lock` пуст. Формат `v4` совместим с MSRV 1.88 (`--locked` проходит,
+см. прогон `cargo test --all` ниже) и был осознанно оставлен, а не
+отменён втихую, как и просил ревью.
+
+### 9. Minor — стиль импортов
+
+`use proxypilot_core::net::Ipv4Net;` в `ovpn_profile.rs` заменён на
+`use proxypilot_core::net::{mask_of, Ipv4Net};` наверху модуля;
+`proxypilot_core::net::mask_of(...)` по месту вызова заменён на короткое
+`mask_of(...)`. В тестовом модуле убран повторный
+`use proxypilot_core::net::Ipv4Net;` — тип уже приходит через
+`use super::*;`.
+
+### TDD этого раунда
+
+Правки шли не по чистому red-green с нуля (менялась уже покрытая тестами
+функция), поэтому RED снят честно, а не реконструирован по памяти:
+production-код коммита `91b235d` (`git show 91b235d:<путь>`) временно
+подставлен обратно под уже написанные новые тесты (тесты — из
+исправленной версии файла), прогнан, и только после того как каждый новый
+тест падал по делу — файлы возвращены к исправленной версии. Ниже —
+дословный вывод обоих прогонов.
+
+#### RED: `crates/core/src/net.rs` (production-код `91b235d` + новые тесты этого раунда)
+
+Команда: `cargo test -p proxypilot-core net::`
+
+```
+running 20 tests
+test net::tests::mask_of_eight_bits_is_a_full_octet ... ok
+test net::tests::mask_of_fourteen_bits_does_not_round_to_a_full_octet ... ok
+test net::tests::mask_of_one_bit ... ok
+test net::tests::mask_of_thirty_one_bits_leaves_a_single_host_bit ... ok
+test net::tests::mask_of_twenty_four_bits_is_three_full_octets ... ok
+test net::tests::parse_rejects_a_malformed_address ... ok
+test net::tests::parse_rejects_a_prefix_over_thirty_two ... ok
+test net::tests::mask_of_zero_is_all_zero ... ok
+test net::tests::parse_and_display_roundtrip ... ok
+test net::tests::mask_of_thirty_two_bits_is_a_single_host ... ok
+test net::tests::parse_rejects_a_missing_prefix ... ok
+test net::tests::parse_rejects_a_non_numeric_prefix ... ok
+test net::tests::parse_rejects_a_prefix_that_does_not_fit_a_byte ... ok
+test net::tests::parse_rejects_a_second_slash ... ok
+test net::tests::parse_rejects_five_octets ... ok
+test net::tests::parse_rejects_whitespace_around_the_prefix ... ok
+test net::tests::parse_rejects_a_leading_plus_prefix ... FAILED
+test net::tests::parse_accepts_a_bare_zero_prefix ... FAILED
+test net::tests::parse_masks_host_bits ... FAILED
+test net::tests::parse_rejects_a_leading_zero_prefix ... FAILED
+
+failures:
+
+---- net::tests::parse_rejects_a_leading_plus_prefix stdout ----
+
+thread 'net::tests::parse_rejects_a_leading_plus_prefix' (9640) panicked at crates\core\src\net.rs:171:9:
+assertion failed: Ipv4Net::from_str("203.0.113.0/+8").is_err()
+
+---- net::tests::parse_accepts_a_bare_zero_prefix stdout ----
+
+thread 'net::tests::parse_accepts_a_bare_zero_prefix' (31076) panicked at crates\core\src\net.rs:143:9:
+assertion `left == right` failed
+  left: 203.0.113.5
+ right: 0.0.0.0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- net::tests::parse_masks_host_bits stdout ----
+
+thread 'net::tests::parse_masks_host_bits' (34140) panicked at crates\core\src\net.rs:136:9:
+assertion `left == right` failed
+  left: 10.1.2.3
+ right: 10.1.2.0
+
+---- net::tests::parse_rejects_a_leading_zero_prefix stdout ----
+
+thread 'net::tests::parse_rejects_a_leading_zero_prefix' (11328) panicked at crates\core\src\net.rs:176:9:
+assertion failed: Ipv4Net::from_str("203.0.113.0/08").is_err()
+
+
+failures:
+    net::tests::parse_accepts_a_bare_zero_prefix
+    net::tests::parse_masks_host_bits
+    net::tests::parse_rejects_a_leading_plus_prefix
+    net::tests::parse_rejects_a_leading_zero_prefix
+
+test result: FAILED. 16 passed; 4 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p proxypilot-core --lib`
+```
+
+Четыре падения — ровно замечания 2 (`parse_masks_host_bits`,
+`parse_accepts_a_bare_zero_prefix` — последний ловит маскировку именно на
+границе `/0`) и 6/7 (`parse_rejects_a_leading_plus_prefix`,
+`parse_rejects_a_leading_zero_prefix`). Остальные новые тесты (пробелы,
+пять октетов, переполнение байта, второй `/`) уже проходили на старом
+коде — они не про новые баги, а про то же поведение, что ревьюер уже
+проверил своим пробником, и остаются в файле как регресс-тесты.
+
+#### RED: `crates/winnet/src/ovpn_profile.rs` (production-код `91b235d` + новые тесты этого раунда)
+
+Команда: `cargo test -p proxypilot-winnet ovpn_profile::`
+
+```
+running 14 tests
+test ovpn_profile::tests::empty_routes_still_adds_the_filter ... ok
+test ovpn_profile::tests::block_outside_dns_is_stripped ... ok
+test ovpn_profile::tests::building_twice_does_not_duplicate_directives ... ok
+test ovpn_profile::tests::every_route_is_present ... ok
+test ovpn_profile::tests::pushed_dns_is_not_filtered ... ok
+test ovpn_profile::tests::redirect_gateway_is_filtered ... ok
+test ovpn_profile::tests::source_lines_survive ... ok
+test ovpn_profile::tests::route_host_bits_are_masked_even_when_ipv4net_is_built_directly ... FAILED
+test ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile ... FAILED
+test ovpn_profile::tests::block_outside_dns_with_extra_whitespace_is_stripped ... FAILED
+test ovpn_profile::tests::crlf_source_stays_crlf ... FAILED
+test ovpn_profile::tests::an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated ... FAILED
+test ovpn_profile::tests::empty_source_has_no_leading_blank_line ... FAILED
+test ovpn_profile::tests::block_outside_dns_with_a_trailing_comment_is_stripped ... FAILED
+
+failures:
+
+---- ovpn_profile::tests::route_host_bits_are_masked_even_when_ipv4net_is_built_directly stdout ----
+
+thread 'ovpn_profile::tests::route_host_bits_are_masked_even_when_ipv4net_is_built_directly' (9684) panicked at crates\winnet\src\ovpn_profile.rs:244:9:
+assertion failed: out.contains("route 203.0.113.0 255.255.255.0")
+
+---- ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile stdout ----
+
+thread 'ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile' (13392) panicked at crates\winnet\src\ovpn_profile.rs:219:9:
+assertion failed: out.contains("CERT")
+
+---- ovpn_profile::tests::block_outside_dns_with_extra_whitespace_is_stripped stdout ----
+
+thread 'ovpn_profile::tests::block_outside_dns_with_extra_whitespace_is_stripped' (33128) panicked at crates\winnet\src\ovpn_profile.rs:171:9:
+assertion failed: !out.contains("block-outside-dns")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ovpn_profile::tests::crlf_source_stays_crlf stdout ----
+
+thread 'ovpn_profile::tests::crlf_source_stays_crlf' (18056) panicked at crates\winnet\src\ovpn_profile.rs:252:9:
+assertion failed: out.contains("client\r\ndev tun")
+
+---- ovpn_profile::tests::an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated stdout ----
+
+thread 'ovpn_profile::tests::an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated' (3264) panicked at crates\winnet\src\ovpn_profile.rs:228:9:
+assertion `left == right` failed
+  left: 2
+ right: 1
+
+---- ovpn_profile::tests::empty_source_has_no_leading_blank_line stdout ----
+
+thread 'ovpn_profile::tests::empty_source_has_no_leading_blank_line' (16964) panicked at crates\winnet\src\ovpn_profile.rs:261:9:
+assertion failed: out.starts_with(BEGIN_MARKER)
+
+---- ovpn_profile::tests::block_outside_dns_with_a_trailing_comment_is_stripped stdout ----
+
+thread 'ovpn_profile::tests::block_outside_dns_with_a_trailing_comment_is_stripped' (3852) panicked at crates\winnet\src\ovpn_profile.rs:181:9:
+assertion failed: !out.contains("block-outside-dns")
+
+
+failures:
+    ovpn_profile::tests::an_existing_redirect_gateway_filter_outside_the_block_is_not_duplicated
+    ovpn_profile::tests::an_unbalanced_begin_marker_does_not_truncate_the_profile
+    ovpn_profile::tests::block_outside_dns_with_a_trailing_comment_is_stripped
+    ovpn_profile::tests::block_outside_dns_with_extra_whitespace_is_stripped
+    ovpn_profile::tests::crlf_source_stays_crlf
+    ovpn_profile::tests::empty_source_has_no_leading_blank_line
+    ovpn_profile::tests::route_host_bits_are_masked_even_when_ipv4net_is_built_directly
+
+test result: FAILED. 7 passed; 7 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p proxypilot-winnet --lib`
+```
+
+Все 7 новых тестов упали, по одному на каждое замечание 1, 3 (два теста —
+пробелы и хвостовой комментарий), 2, 4, 5, 6/7. После этого файлы
+возвращены к исправленной версии и весь прогон (все 4 крейта) стал
+зелёным — см. ниже.
+
+### CI, три команды — после исправлений
+
+#### `cargo test --all`
+
+```
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.60s   (proxypilot-app, bin unittests)
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s    (proxypilot-bridge, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s     (proxypilot-bridge, bin unittests)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s      (proxypilot-bridge, tests/cli.rs)
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s    (proxypilot-core, lib unittests)
+test result: ok. 80 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.13s    (proxypilot-winnet, lib unittests)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s     (doc-tests x3)
+```
+
+Итого: 324 passed, 0 failed, 3 ignored (было 309 после исходной задачи;
+прирост — 8 новых тестов в `core::net` + 7 новых в `ovpn_profile` = 15,
+309 + 15 = 324, сходится).
+
+#### `cargo clippy --all-targets -- -D warnings`
+
+```
+    Checking proxypilot-core v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\core)
+    Checking proxypilot-bridge v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\bridge)
+    Checking proxypilot-winnet v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\winnet)
+    Checking proxypilot-app v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.08s
+```
+
+Чисто. Ни одного `#[allow(...)]` не добавлено.
+
+#### `cargo fmt --all --check`
+
+Первый прогон после правок нашёл несколько мест, где `cargo fmt` иначе
+разбивает многострочные `push(...)` (сам код из фикс-раунда) — `cargo fmt
+--all` их поправил, второй прогон:
+
+```
+FMT_OK
+```
+
+### Границы (подтверждено повторно)
+
+Никакой `openvpn-gui.exe` не запускался. Ни один файл под
+`C:\Program Files\OpenVPN\config\` не читался и не писался — весь
+фикс-раунд правил только `crates/core/src/net.rs` и
+`crates/winnet/src/ovpn_profile.rs`, оба теста работают со строками в
+памяти. Запись в реестр не производилась. `#[allow(...)]` не
+использован, `unsafe`-блоков не добавлено.
