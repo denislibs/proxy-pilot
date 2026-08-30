@@ -11,6 +11,7 @@ pub mod networks;
 pub mod openvpn;
 pub mod ovpn_profile;
 pub mod sysproxy;
+pub mod tunnel_state;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WinNetError {
