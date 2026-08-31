@@ -14,6 +14,7 @@ path = "src/main.rs"
 proxypilot-core = { path = "../core" }
 proxypilot-bridge = { path = "../bridge" }
 proxypilot-winnet = { path = "../winnet" }
+proxypilot-icon = { path = "../icon" }
 # Только `install`/`uninstall` (регистрация в SCM) — команды
 # `install-service`/`uninstall-service` ниже в `main.rs`. Единственный
 # запрос UAC во всём продукте, вызывается не этой сессией.
@@ -46,3 +47,15 @@ windows = { workspace = true, features = [
 # продакшн-бинарника, поэтому в нём этих функций не будет вовсе.
 [dev-dependencies]
 proxypilot-winnet = { path = "../winnet", features = ["test-registry"] }
+# Только для tests/version_resource.rs: GetFileVersionInfoW/VerQueryValueW,
+# которыми тест читает VS_FIXEDFILEINFO уже собранного exe. Отдельно от
+# фич windows выше — в продакшн-бинарник (только [dependencies]) это не
+# попадает.
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+# build.rs генерирует .ico из того же кода, что рисует иконки трея
+# (`proxypilot-icon`), и вшивает его вместе с версией/метаданными в exe.
+[build-dependencies]
+proxypilot-icon = { path = "../icon" }
+winres = "0.1"
+ico = "0.5"
