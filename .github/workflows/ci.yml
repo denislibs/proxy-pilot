@@ -30,6 +30,88 @@ jobs:
       - name: Сборка релиза
         run: cargo build --release -p proxypilot-bridge -p proxypilot-app
 
+      # Сертификата сегодня нет: покупка OV/EV на юрлицо с проверкой
+      # организации удостоверяющим центром — это закупка, а не задача
+      # программиста (docs/process/win-delivery/task-2-brief.md). Конвейер
+      # обязан собираться и без него, поэтому секрет читается, а не
+      # требуется: пустой секрет — это шаг «пропущен и предупредили»,
+      # а не сломанная сборка.
+      #
+      # Секреты, которые должен завести будущий сопровождающий, когда
+      # сертификат появится (Settings → Secrets and variables → Actions):
+      #   WINDOWS_CERTIFICATE_BASE64  — PFX-файл сертификата (закрытый ключ
+      #     + цепочка), целиком закодированный в base64 одной строкой, например:
+      #       certutil -encode cert.pfx cert.b64   (взять текст между
+      #       строками -----BEGIN/END CERTIFICATE-----, без переносов —
+      #       либо [Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))
+      #   WINDOWS_CERTIFICATE_PASSWORD — пароль, которым PFX защищён.
+      # Больше нигде в конвейере ничего менять не придётся — оба секрета
+      # подхватятся сами при следующем запуске.
+      - name: Подпись Authenticode
+        id: sign
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_BASE64)) {
+            Write-Output "::warning::Секрет WINDOWS_CERTIFICATE_BASE64 не задан — собранные .exe НЕ подписаны Authenticode. Это ожидаемо, пока сертификат не куплен (см. docs/process/win-delivery/task-2-brief.md). Получатели один раз увидят предупреждение SmartScreen. Когда сертификат появится, добавьте секреты WINDOWS_CERTIFICATE_BASE64 и WINDOWS_CERTIFICATE_PASSWORD — правка этого workflow не понадобится."
+            echo "signed=false" >> $env:GITHUB_OUTPUT
+          } elseif ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            # Сертификат задан, а пароль — нет: это не «сертификата пока
+            # нет», а сломанная настройка секретов, и её надо уронить, а не
+            # молча пропустить как первый случай.
+            throw "WINDOWS_CERTIFICATE_BASE64 задан, а WINDOWS_CERTIFICATE_PASSWORD — нет. Это не отсутствие сертификата, а неполная настройка секретов."
+          } else {
+            $certPath = Join-Path $env:RUNNER_TEMP "proxypilot-codesign.pfx"
+            [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+
+            # signtool не гарантированно есть в PATH на образе windows-latest —
+            # ищем его там, где реально лежит поставленный на образ Windows SDK
+            # (тот же Kit, что использует rc.exe из задачи 1).
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction Stop |
+              Where-Object { $_.FullName -like "*\x64\*" } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signtool) {
+              throw "signtool.exe не найден под Windows Kits — образ раннера изменился, путь поиска надо пересмотреть."
+            }
+            # Каталог с найденным signtool.exe кладём в PATH для следующего
+            # шага (проверки), чтобы не искать его дважды.
+            Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $signtool)
+
+            $targets = @(
+              "target\release\proxypilot.exe",
+              "target\release\proxypilot-bridge.exe"
+            )
+            foreach ($exe in $targets) {
+              # /tr + /td sha256 — отметка времени RFC 3161: подпись
+              # переживёт истечение сертификата, а не протухнет вместе с ним.
+              & $signtool sign /fd sha256 /f $certPath /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr http://timestamp.digicert.com /td sha256 $exe
+              if ($LASTEXITCODE -ne 0) {
+                throw "signtool sign упал на $exe (код $LASTEXITCODE)"
+              }
+            }
+
+            Remove-Item $certPath -Force
+            echo "signed=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Проверка подписи
+        # Выполняется, только если подпись реально была: без сертификата
+        # проверять нечего, а падать на отсутствии подписи здесь нельзя —
+        # это именно тот путь, который обязан оставаться зелёным.
+        if: steps.sign.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          # Подписать и не проверить — узнать о проблеме от получателя.
+          foreach ($exe in @("target\release\proxypilot.exe", "target\release\proxypilot-bridge.exe")) {
+            & signtool verify /pa /v $exe
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify не подтвердил подпись на $exe"
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: proxypilot
