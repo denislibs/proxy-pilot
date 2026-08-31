@@ -830,31 +830,25 @@ impl settings_page::Tunnel for WinTunnel {
         // (`tunnel_log::liveness`), НЕ по имени адаптера: fix round 1
         // задачи 7 нашёл, что реальные адаптеры называются по драйверу
         // («OpenVPN Wintun», «TAP-Windows Adapter V9»), никогда — по имени
-        // соединения, и алиас-based `our_tunnel_up` возвращала `false`
-        // навсегда (докблок `settings_page::TUNNEL_PROFILE_NAME`,
-        // `winnet::tunnel_log`).
-        let (our_tunnel_up, liveness_error) = match tunnel_log::liveness(profile_name) {
-            Ok(live) => (live == tunnel_log::TunnelLiveness::Up, None),
-            Err(e) => (false, Some(e.to_string())),
-        };
+        // соединения.
+        let log_up = tunnel_log::liveness(profile_name)
+            .map(|live| live == tunnel_log::TunnelLiveness::Up)
+            .map_err(|e| e.to_string());
 
-        // Таблица маршрутов + алиас адаптера остаются в деле только для
-        // `foreign_tunnel_up` — предупредить ДО подъёма, что офисные
-        // подсети уже кем-то заняты. Независимый источник, независимая
-        // ошибка: отказ прочитать маршруты не должен гасить то, что мы уже
-        // честно знаем о своей живости из лога, и наоборот.
-        let (foreign_tunnel_up, routes_error) = match Self::adapters() {
-            Ok(adapters) => (
-                tunnel_state::foreign_tunnel_up(office_subnets, &adapters, profile_name),
-                None,
-            ),
-            Err(e) => (false, Some(e)),
-        };
+        // Несёт ли ХОТЬ ОДИН туннельный адаптер наши подсети — round 2
+        // задачи 7 убрал alias отсюда целиком (`tunnel_state::any_tunnel_carries`
+        // больше не пытается решить, чей это адаптер).
+        let carries = Self::adapters()
+            .map(|adapters| tunnel_state::any_tunnel_carries(office_subnets, &adapters));
+
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(log_up, carries);
 
         settings_page::TunnelSnapshot {
             installed: true,
             profile_installed,
             our_tunnel_up,
+            rising,
             liveness_error,
             foreign_tunnel_up,
             routes_error,
@@ -896,6 +890,71 @@ impl settings_page::Tunnel for WinTunnel {
     fn install_service(&self) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         ui::request_elevation(&exe, "install-service")
+    }
+}
+
+/// Сводит два независимых источника («лог считает поднятым?», «несёт ли
+/// хоть один туннельный адаптер наши подсети?») в пять полей
+/// `TunnelSnapshot` — чистая функция ради теста, отдельно от чтения лога
+/// и таблицы маршрутов (`WinTunnel::snapshot` выше).
+///
+/// Round 2 задачи 7: `our_tunnel_up` требует ПОДТВЕРЖДЕНИЯ ОБОИХ
+/// источников разом, а не одного лога — иначе `openvpn.exe`, убитый без
+/// штатного выхода, продолжал бы читаться как «поднят» сколько угодно
+/// долго (докблок `winnet::tunnel_log`, «Честные пределы»).
+/// `foreign_tunnel_up` — что маршруты заняты, а лог НЕ подтверждает, что
+/// это мы. Возврат: `(our_tunnel_up, rising, foreign_tunnel_up,
+/// liveness_error, routes_error)`.
+///
+/// Два источника ошибок остаются независимыми (см. докблок
+/// `settings_page::TunnelSnapshot`): отказ прочитать маршруты не должен
+/// стирать то, что честно сказал лог, и наоборот. Особый случай — лог
+/// говорит «поднято», а маршруты прочитать не удалось: подтвердить
+/// подъём НЕЧЕМ (весь смысл требовать оба источника — не верить логу в
+/// одиночку), поэтому это тоже «не знаю», а не «поднято на слово лога».
+fn combine_tunnel_facts(
+    log_up: Result<bool, String>,
+    carries: Result<bool, String>,
+) -> (bool, bool, bool, Option<String>, Option<String>) {
+    match (log_up, carries) {
+        (Ok(true), Ok(true)) => (true, false, false, None, None),
+        // «Поднимается»: лог уже увидел успешное подключение, но
+        // маршруты профиля (`route ...` из собранного `.ovpn`) ещё не
+        // встали — короткое окно сразу после «Поднять туннель».
+        (Ok(true), Ok(false)) => (false, true, false, None, None),
+        (Ok(false), Ok(true)) => (false, false, true, None, None),
+        (Ok(false), Ok(false)) => (false, false, false, None, None),
+        // Лог точно говорит «не поднято» — про `our_tunnel_up` сказано
+        // всё, что нужно, без участия маршрутов. Отказ читать маршруты
+        // означает только «не проверить, свободны ли они для подъёма».
+        (Ok(false), Err(e)) => (false, false, false, None, Some(e)),
+        // Лог говорит «поднято», но подтвердить нечем — не верим логу в
+        // одиночку (в этом и была цель объединения), и не притворяемся,
+        // что знаем больше маршрутов.
+        (Ok(true), Err(e)) => (
+            false,
+            false,
+            false,
+            Some(format!(
+                "лог утверждает, что туннель поднят, но подтвердить это \
+                 таблицей маршрутов не удалось: {e}"
+            )),
+            None,
+        ),
+        // Лог недоступен целиком — по этой же причине не подтвердить
+        // `our_tunnel_up`, и по той же причине не утверждать
+        // `foreign_tunnel_up`: маршруты МОГУТ быть заняты нашим же
+        // туннелем, который мы просто не можем подтвердить логом
+        // (регрессия round 2 — см. тест
+        // `an_unreadable_log_does_not_call_our_own_tunnel_someone_elses`).
+        (Err(e), Ok(_)) => (false, false, false, Some(e), None),
+        (Err(e1), Err(e2)) => (
+            false,
+            false,
+            false,
+            Some(format!("{e1}; и таблица маршрутов тоже не читается: {e2}")),
+            None,
+        ),
     }
 }
 
@@ -1144,6 +1203,132 @@ fn install_console_handler() {}
 mod tests {
     use super::*;
     use proxypilot_core::config::OfficeNetwork;
+
+    // ---- Задача 7, fix round 2: combine_tunnel_facts ----
+
+    #[test]
+    fn both_sources_confirm_up() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(true), Ok(true)),
+            (true, false, false, None, None)
+        );
+    }
+
+    #[test]
+    fn log_up_but_routes_not_installed_yet_is_rising_not_alarming() {
+        // Round 2: короткое окно сразу после «Поднять туннель» —
+        // лог уже видел успех, маршруты профиля ещё не встали. Не «не
+        // поднят» (это выглядело бы как «нажмите снова») и не «поднят»
+        // (маршруты ещё не доказали это) — отдельное честное состояние.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(true), Ok(false));
+        assert!(!our_tunnel_up);
+        assert!(rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_none());
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn routes_carried_but_log_says_not_up_is_foreign() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(false), Ok(true)),
+            (false, false, true, None, None)
+        );
+    }
+
+    #[test]
+    fn neither_source_reports_anything_is_plain_down() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(false), Ok(false)),
+            (false, false, false, None, None)
+        );
+    }
+
+    #[test]
+    fn a_hard_killed_process_stops_claiming_up_once_routes_disappear() {
+        // Ровно сценарий, ради которого round 2 затеян: openvpn.exe убит
+        // без штатного выхода — лог (в одиночку) продолжал бы врать
+        // «поднято», но маршруты уходят с процессом почти сразу.
+        // combine_tunnel_facts обязана погасить our_tunnel_up, а не
+        // поверить логу на слово.
+        let (our_tunnel_up, ..) = combine_tunnel_facts(Ok(true), Ok(false));
+        assert!(!our_tunnel_up, "лог в одиночку не должен решать «поднято»");
+    }
+
+    #[test]
+    fn routes_unreadable_while_log_says_down_blocks_only_the_raise_reason() {
+        // Лог уверенно говорит «не поднято» — про our_tunnel_up вопросов
+        // нет без всякого участия маршрутов. Отказ читать маршруты сюда
+        // не просачивается как liveness_error.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(false), Err("тестовый отказ".to_string()));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_none());
+        assert_eq!(routes_error.as_deref(), Some("тестовый отказ"));
+    }
+
+    #[test]
+    fn log_says_up_but_routes_cannot_confirm_it_is_reported_as_unknown() {
+        // «Поднято» на одно лишь слово лога, без маршрутов, подтвердить
+        // нечем — ровно то доверие логу в одиночку, ради устранения
+        // которого и введено объединение. Не «поднято», а «не знаю».
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(true), Err("тестовый отказ".to_string()));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_some());
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_log_does_not_call_our_own_tunnel_someone_elses() {
+        // Регрессия, которая мотивировала round 2: лог нечитаем, а
+        // какой-то туннельный адаптер несёт наши подсети (возможно, это
+        // как раз наш собственный, только что поднятый, туннель — узнать
+        // логом сейчас нельзя). Страница обязана сказать «не знаю», а не
+        // «занято чужим» — до этого исправления `foreign_tunnel_up`
+        // строилась бы по alias'у адаптера и ошибочно утверждала бы
+        // именно это.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Err("тестовый отказ чтения лога".to_string()), Ok(true));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(
+            !foreign_tunnel_up,
+            "неизвестность лога не обязана превращаться в «занято чужим»"
+        );
+        assert_eq!(
+            liveness_error.as_deref(),
+            Some("тестовый отказ чтения лога")
+        );
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_log_stays_unknown_even_when_routes_are_free() {
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, _) =
+            combine_tunnel_facts(Err("тестовый отказ".to_string()), Ok(false));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_some());
+    }
+
+    #[test]
+    fn both_sources_failing_mentions_both_errors() {
+        let (.., liveness_error, routes_error) = combine_tunnel_facts(
+            Err("отказ лога".to_string()),
+            Err("отказ маршрутов".to_string()),
+        );
+        let msg = liveness_error.expect("оба отказа обязаны быть сообщены");
+        assert!(msg.contains("отказ лога"), "получили: {msg}");
+        assert!(msg.contains("отказ маршрутов"), "получили: {msg}");
+        assert!(routes_error.is_none());
+    }
 
     /// Порт, на котором слушатель привязан в этих тестах, и порт, который
     /// «вводит человек». Разные намеренно: совпади они — тесты не различали

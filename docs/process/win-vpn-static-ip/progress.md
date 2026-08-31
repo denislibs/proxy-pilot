@@ -365,3 +365,30 @@ Get-Item, Get-ItemProperty на HKCU\Software\OpenVPN-GUI) — ничего не
 подключено, не отключено, не установлено, не изменено; реальные имена
 чужих log-файлов этой машины (её собственного пользователя) в отчёт и в
 код не попали
+Task 7: fix round 2 (1 finding, dispatched и устранён) — round 1 оставил
+alias работать наполовину: пока our_tunnel_up (лог) == false,
+foreign_tunnel_up всё ещё строилась по tunnel_state::foreign_tunnel_up с
+тем же доказанно неверным our_alias. Остаточный случай: лог нечитаем ->
+our_tunnel_up падает в false -> код мог дойти до alias-сравнения и назвать
+наш же туннель чужим. Ревью потребовало убрать alias из tunnel_state
+целиком, а не только из приоритета
+Task 7: fix round 2 — tunnel_state::{our_tunnel_up, foreign_tunnel_up,
+same_alias} удалены; новая tunnel_state::any_tunnel_carries(routes,
+adapters) отвечает только «несёт ли хоть один туннельный адаптер наши
+подсети», без alias вовсе. Вызывающий (WinTunnel::snapshot, main.rs)
+строит our_tunnel_up/foreign_tunnel_up чистой функцией
+combine_tunnel_facts из связки (лог, any_tunnel_carries) — 9 комбинаций
+Result<bool>×Result<bool>, все протестированы
+Task 7: fix round 2 — конъюнкция «лог Up И несёт маршруты» закрывает
+hard-kill дыру, которую tunnel_log в одиночку закрыть не мог: убитый без
+штатного выхода openvpn.exe продолжал бы врать «поднято» по логу, но
+маршруты уходят с процессом, и any_tunnel_carries гасит ложный true.
+Побочный эффект — новое честное состояние TunnelSnapshot.rising («лог уже
+подтвердил, маршруты ещё не встали», короткое окно сразу после подъёма) —
+не «опущен» (не приглашает нажать «Поднять» ещё раз) и не «поднят»
+Task 7: fix round 2 complete (commit после 8109085) — 493 теста (было 482,
++11), клиппи и формат чисты. Живых действий не было: раунд опирался на
+факты, уже установленные round 1 на живой машине, без повторного
+обращения к ней. Регрессионный тест
+an_unreadable_log_does_not_call_our_own_tunnel_someone_elses фиксирует
+случай, который мотивировал раунд

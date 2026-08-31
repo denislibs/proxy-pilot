@@ -1,11 +1,46 @@
-//! Распознавание чужого туннеля по таблице маршрутов.
+//! Занята ли уже офисная подсеть каким-нибудь туннельным адаптером.
 //!
 //! Критерий не «есть ли туннельный адаптер», а «лежит ли уже маршрут в
-//! наши офисные сети через чужой туннель». У пользователей Tailscale или
+//! наши офисные сети через туннель». У пользователей Tailscale или
 //! WireGuard туннельный адаптер поднят постоянно; наивная проверка «есть
 //! tun — значит занято» не дала бы поднять офисный туннель никогда и
 //! убила бы функцию у всех, кто пользуется хоть каким-то VPN. Логика
 //! перенесена из macOS-версии дословно — там она такая по той же причине.
+//!
+//! # Alias здесь больше нет — история почему (round 1 и round 2, задача 7)
+//!
+//! До round 1 задачи 7 этот модуль ещё и различал «наш» туннель от
+//! «чужого» по псевдониму сетевого адаптера (`interface_alias`,
+//! параметр `our_alias`). Round 1 прочёл реальные адаптеры живой машины
+//! (`Get-NetAdapter`, только чтение) и нашёл: OpenVPN называет адаптер по
+//! ДРАЙВЕРУ («OpenVPN Wintun», «TAP-Windows Adapter V9»), никогда — по
+//! имени профиля/соединения. Alias как признак «наш или чужой» был не
+//! просто ненадёжным (это и так было задокументировано ниже и в задаче
+//! 3) — он был структурно неверным допущением, гарантированно
+//! проваливавшимся: свой же поднятый туннель читался как чужой, и
+//! правило «не трогать чужой» запирало разом и подъём, и опускание.
+//!
+//! Round 1 подключил надёжный источник для «наш ли туннель поднят» —
+//! `winnet::tunnel_log::liveness`, лог `openvpn-gui.exe`, ключуемый именем
+//! профиля (тем, чем вызывающий код действительно владеет), — но оставил
+//! alias работать в этом модуле для «чужой» половины вопроса. Round 2
+//! заметил: раз имя адаптера доказанно ничего не отличает, оставлять его
+//! хоть где-то в этом модуле — держать наполовину то же основание, что
+//! только что признано неверным. Убран целиком: `any_tunnel_carries`
+//! ниже отвечает только на вопрос «несёт ли ХОТЬ ОДИН туннельный адаптер
+//! наши подсети», без единой попытки решить, чей это адаптер. Различение
+//! «наш/чужой/неизвестно» полностью переехало к вызывающему
+//! (`settings_page::Tunnel` в `crates/app`), который комбинирует этот
+//! факт с `tunnel_log::liveness` — двумя независимыми источниками вместо
+//! одного ненадёжного.
+//!
+//! Это и закрывает дыру, которую `tunnel_log` в одиночку закрыть не
+//! может: если `openvpn.exe` убит без штатного выхода (`taskkill /F`,
+//! обрыв питания), лог продолжает утверждать «поднято», но маршруты
+//! уходят вместе с процессом — `any_tunnel_carries` в этот момент честно
+//! становится `false`, и вызывающий перестаёт заявлять «поднято». Лог
+//! один этого не знал бы; маршруты одни не отличили бы наш адаптер от
+//! чужого. Вместе — отличают.
 //!
 //! Функции чистые: таблицу маршрутов и список адаптеров собирает
 //! вызывающий (winnet не делает здесь никакого ввода-вывода), что и
@@ -13,16 +48,13 @@
 //! офисной сети и наоборот) на фикстурах, не имея их под рукой на этой
 //! машине.
 //!
-//! Унаследованное ограничение (форма `AdapterRoute` задана брифом этой
-//! задачи, менять её — не решение этого модуля): `interface_alias` —
-//! это псевдоним сетевого интерфейса Windows, свободная строка,
-//! которую пользователь может переименовать когда угодно, а разные
-//! средства (`route print`, `Get-NetRoute`, `netsh`) ещё и показывают
-//! её по-разному. Это не устойчивый идентификатор — переименование
-//! адаптера, пока наш туннель поднят, снаружи выглядит так же, как
-//! появление чужого туннеля с тем же маршрутом. Устойчивым был бы LUID
-//! или индекс интерфейса. Задачи 4 и 7 наследуют это ограничение вместе
-//! с типом и должны о нём знать, а не удивляться ему на живой машине.
+//! `AdapterRoute.interface_alias` (форма задана брифом задачи 3) поле
+//! сохранено — `winnet::routes` всё ещё его собирает, дёшево, тем же
+//! проходом, что и `is_tunnel` — но этот модуль его больше не читает.
+//! Причина, по которой оно НЕ годится для решений, остаётся в силе и
+//! задокументирована выше: псевдоним интерфейса Windows не устойчивый
+//! идентификатор (переименовываем пользователем, разные средства —
+//! `route print`, `Get-NetRoute`, `netsh` — показывают его по-разному).
 
 use proxypilot_core::net::{mask_of, Ipv4Net};
 
@@ -32,26 +64,12 @@ use proxypilot_core::net::{mask_of, Ipv4Net};
 #[derive(Debug)]
 pub struct AdapterRoute {
     pub dest: Ipv4Net,
+    /// Собирается вызывающим (`winnet::routes`) и сохранён в структуре
+    /// на случай будущей диагностики/лога, но `any_tunnel_carries` ниже
+    /// его не читает — см. докблок модуля про то, почему alias здесь
+    /// больше ничего не решает.
     pub interface_alias: String,
     pub is_tunnel: bool,
-}
-
-/// Сравнение псевдонимов интерфейса без учёта регистра и обрамляющих
-/// пробелов. Windows не гарантирует, каким регистром вернёт alias тот
-/// или иной инструмент (`route print` и `Get-NetRoute` расходятся), и
-/// байт-в-байт сравнение превращает это расхождение в ложный «чужой
-/// туннель» на нашем же адаптере — то есть в дедлок: подъём и останов
-/// заблокированы, потому что наш туннель считается чужим. Через
-/// `to_lowercase()`, а не `eq_ignore_ascii_case`, — сам псевдоним не
-/// обязан быть ASCII.
-///
-/// Пустой `our_alias` (`""`) намеренно не считается совпадением ни с
-/// каким реальным именем адаптера: непустой алиас никогда не сравнится
-/// равным пустой строке, поэтому вызывающий с ещё не настроенным алиасом
-/// получит «наш туннель не поднят» и «есть чужой» — отказ в
-/// консервативную сторону (не занизит риск), а не наоборот.
-fn same_alias(a: &str, b: &str) -> bool {
-    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 /// Границы подсети как пара адресов `[start, end]`. Использует `mask_of`
@@ -82,33 +100,15 @@ fn overlaps(a: &Ipv4Net, b: &Ipv4Net) -> bool {
     a_start <= b_end && b_start <= a_end
 }
 
-/// Наш собственный туннель уже поднят: среди адаптеров есть туннельный с
-/// нашим псевдонимом интерфейса. Маршруты роли не играют — здесь важен
-/// сам факт «адаптер существует и это туннель», а не то, что через него
-/// идёт (этим занимается `foreign_tunnel_up`).
-pub fn our_tunnel_up(adapters: &[AdapterRoute], our_alias: &str) -> bool {
+/// Несёт ли хоть один туннельный адаптер маршрут, пересекающийся с
+/// `routes` — без какой-либо попытки решить, ЧЕЙ это адаптер (round 2
+/// задачи 7, см. докблок модуля). Вызывающий комбинирует этот факт с
+/// `tunnel_log::liveness`, чтобы получить «наш поднят» / «занято кем-то
+/// ещё» / «не знаю» — этот модуль сам этих трёх слов не произносит.
+pub fn any_tunnel_carries(routes: &[Ipv4Net], adapters: &[AdapterRoute]) -> bool {
     adapters
         .iter()
-        .any(|a| a.is_tunnel && same_alias(&a.interface_alias, our_alias))
-}
-
-/// Чужой туннель уже несёт наши офисные сети: среди адаптеров есть
-/// туннельный (`is_tunnel`), чей псевдоним НЕ совпадает с нашим, и чей
-/// маршрут (`dest`) пересекается хотя бы с одной из подсетей `routes`.
-///
-/// Отклонение от сигнатуры плана: добавлен параметр `our_alias`. Без
-/// него функция не смогла бы отличить наш собственный (уже поднятый)
-/// туннель от чужого, а «наш туннель не считается чужим» — прямое
-/// требование приёмки; переносить это решение на вызывающего значило бы
-/// не проверять его тестами этого модуля. Сигнатура остаётся чистой
-/// функцией: вызывающий (задачи 4 и 7) и так знает `our_alias` — он же
-/// передаётся в `our_tunnel_up`.
-pub fn foreign_tunnel_up(routes: &[Ipv4Net], adapters: &[AdapterRoute], our_alias: &str) -> bool {
-    adapters.iter().any(|a| {
-        a.is_tunnel
-            && !same_alias(&a.interface_alias, our_alias)
-            && routes.iter().any(|r| overlaps(r, &a.dest))
-    })
+        .any(|a| a.is_tunnel && routes.iter().any(|r| overlaps(r, &a.dest)))
 }
 
 #[cfg(test)]
@@ -121,137 +121,82 @@ mod tests {
         Ipv4Net::from_str(s).expect("валидная подсеть в тесте")
     }
 
+    fn adapter(dest: &str, is_tunnel: bool) -> AdapterRoute {
+        AdapterRoute {
+            dest: net(dest),
+            // Значение — только для читаемости отладочного вывода теста;
+            // `any_tunnel_carries` его не читает (докблок модуля).
+            interface_alias: "SomeAdapter".to_string(),
+            is_tunnel,
+        }
+    }
+
     #[test]
-    fn permanently_up_tailscale_is_not_foreign_for_office_10_x() {
-        let adapters = [AdapterRoute {
-            dest: net("100.64.0.0/10"),
-            interface_alias: "Tailscale".to_string(),
-            is_tunnel: true,
-        }];
+    fn a_permanently_up_tailscale_does_not_carry_a_disjoint_office_subnet() {
+        // Tailscale-подобный адаптер поднят постоянно и несёт СВОЮ
+        // подсеть (100.64.0.0/10) — она не пересекается с офисной 10/8,
+        // поэтому не в счёт, независимо от того, чей это адаптер.
+        let adapters = [adapter("100.64.0.0/10", true)];
         let office = [net("10.0.0.0/8")];
-        assert!(!foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(!any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn tunnel_carrying_office_route_is_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: "SomeoneElsesVPN".to_string(),
-            is_tunnel: true,
-        }];
+    fn a_tunnel_carrying_the_exact_office_route_counts() {
+        let adapters = [adapter("10.5.0.0/16", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn our_own_tunnel_is_not_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: "OfficeVPN".to_string(),
-            is_tunnel: true,
-        }];
+    fn office_route_through_a_non_tunnel_adapter_does_not_count() {
+        let adapters = [adapter("10.5.0.0/16", false)];
         let office = [net("10.5.0.0/16")];
-        assert!(!foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(!any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn office_route_through_non_tunnel_adapter_is_not_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: "Ethernet".to_string(),
-            is_tunnel: false,
-        }];
+    fn an_empty_routing_table_carries_nothing() {
+        assert!(!any_tunnel_carries(&[], &[]));
+    }
+
+    #[test]
+    fn a_broader_tunnel_route_covering_a_narrower_office_subnet_counts() {
+        let adapters = [adapter("10.0.0.0/8", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(!foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn empty_routing_table_is_not_foreign() {
-        assert!(!foreign_tunnel_up(&[], &[], "OfficeVPN"));
-    }
-
-    #[test]
-    fn broader_foreign_route_covering_a_narrower_office_subnet_is_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("10.0.0.0/8"),
-            interface_alias: "SomeoneElsesVPN".to_string(),
-            is_tunnel: true,
-        }];
+    fn a_narrower_tunnel_route_inside_a_broader_office_subnet_counts() {
+        let adapters = [adapter("10.5.1.0/24", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn narrower_foreign_route_inside_a_broader_office_subnet_is_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.1.0/24"),
-            interface_alias: "SomeoneElsesVPN".to_string(),
-            is_tunnel: true,
-        }];
+    fn a_disjoint_tunnel_route_does_not_count() {
+        let adapters = [adapter("192.168.1.0/24", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(!any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn disjoint_foreign_tunnel_route_is_not_foreign() {
-        let adapters = [AdapterRoute {
-            dest: net("192.168.1.0/24"),
-            interface_alias: "SomeoneElsesVPN".to_string(),
-            is_tunnel: true,
-        }];
-        let office = [net("10.5.0.0/16")];
-        assert!(!foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
-    }
-
-    #[test]
-    fn our_tunnel_up_true_when_our_alias_is_a_tunnel() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: "OfficeVPN".to_string(),
-            is_tunnel: true,
-        }];
-        assert!(our_tunnel_up(&adapters, "OfficeVPN"));
-    }
-
-    #[test]
-    fn our_tunnel_up_false_when_alias_matches_but_not_a_tunnel() {
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: "OfficeVPN".to_string(),
-            is_tunnel: false,
-        }];
-        assert!(!our_tunnel_up(&adapters, "OfficeVPN"));
-    }
-
-    #[test]
-    fn our_tunnel_up_false_on_empty_adapters() {
-        assert!(!our_tunnel_up(&[], "OfficeVPN"));
-    }
-
-    #[test]
-    fn a_full_tunnel_commercial_vpn_is_foreign() {
+    fn a_full_tunnel_commercial_vpn_counts() {
         // 0.0.0.0/0 — типичный маршрут коммерческого full-tunnel VPN
         // (NordVPN и подобные): он несёт вообще всё, включая наши
         // офисные сети, а не только их.
-        let adapters = [AdapterRoute {
-            dest: net("0.0.0.0/0"),
-            interface_alias: "CommercialVPN".to_string(),
-            is_tunnel: true,
-        }];
+        let adapters = [adapter("0.0.0.0/0", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn a_single_host_route_inside_the_office_subnet_is_foreign() {
+    fn a_single_host_route_inside_the_office_subnet_counts() {
         // /32 — маршрут на один хост, целиком внутри офисной /16.
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.7/32"),
-            interface_alias: "SomeoneElsesVPN".to_string(),
-            is_tunnel: true,
-        }];
+        let adapters = [adapter("10.5.0.7/32", true)];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
@@ -265,25 +210,23 @@ mod tests {
         };
         let adapters = [AdapterRoute {
             dest: unmasked_dest,
-            interface_alias: "SomeoneElsesVPN".to_string(),
+            interface_alias: "SomeAdapter".to_string(),
             is_tunnel: true,
         }];
         let office = [net("10.5.0.0/16")];
-        assert!(foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 
     #[test]
-    fn alias_comparison_is_case_insensitive_and_trims_whitespace() {
-        // Находка ревью: байт-в-байт сравнение алиаса дало бы дедлок —
-        // наш же туннель считался бы чужим только из-за регистра или
-        // пробела, добавленного каким-то инструментом Windows.
-        let adapters = [AdapterRoute {
-            dest: net("10.5.0.0/16"),
-            interface_alias: " officevpn ".to_string(),
-            is_tunnel: true,
-        }];
+    fn several_adapters_only_one_of_which_carries_still_counts() {
+        // Не первый попавшийся адаптер решает: если хоть один несёт
+        // пересекающийся маршрут, функция обязана вернуть true, даже
+        // если остальные — нет.
+        let adapters = [
+            adapter("192.168.1.0/24", true),
+            adapter("10.5.0.0/16", true),
+        ];
         let office = [net("10.5.0.0/16")];
-        assert!(our_tunnel_up(&adapters, "OfficeVPN"));
-        assert!(!foreign_tunnel_up(&office, &adapters, "OfficeVPN"));
+        assert!(any_tunnel_carries(&office, &adapters));
     }
 }

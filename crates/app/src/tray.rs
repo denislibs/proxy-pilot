@@ -182,6 +182,11 @@ pub fn tunnel_text(snap: &TunnelSnapshot) -> String {
     if snap.our_tunnel_up {
         return "Туннель: поднят".to_string();
     }
+    if snap.rising {
+        // Round 2: лог уже подтвердил успех, маршруты профиля ещё не
+        // встали — короткое окно сразу после «Поднять туннель».
+        return "Туннель: поднимается…".to_string();
+    }
     if snap.routes_error.is_some() {
         return "Туннель: опущен · маршруты не проверены".to_string();
     }
@@ -837,5 +842,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(tunnel_text(&snap), "Туннель: поднят");
+    }
+
+    #[test]
+    fn tunnel_text_names_the_rising_window_distinctly_from_down() {
+        // Round 2: лог уже подтвердил успех, маршруты профиля ещё не
+        // встали — не должно читаться как «опущен» (приглашение нажать
+        // «Поднять» ещё раз).
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            rising: true,
+            ..Default::default()
+        };
+        assert_eq!(tunnel_text(&snap), "Туннель: поднимается…");
+    }
+
+    #[test]
+    fn tunnel_text_prefers_rising_over_a_misclassified_occupied_reading() {
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            rising: true,
+            foreign_tunnel_up: true,
+            ..Default::default()
+        };
+        assert_eq!(tunnel_text(&snap), "Туннель: поднимается…");
     }
 }
