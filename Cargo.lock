@@ -951,7 +951,6 @@ dependencies = [
 name = "proxypilot-netsvc"
 version = "0.1.0"
 dependencies = [
- "directories",
  "proxypilot-core",
  "proxypilot-winnet",
  "serde",
@@ -961,7 +960,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows",
- "windows-core",
 ]
 
 [[package]]

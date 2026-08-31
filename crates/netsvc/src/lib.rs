@@ -34,6 +34,12 @@
 //! - [`install`] — регистрация/снятие службы через Service Control Manager
 //!   (`CreateServiceW`/`DeleteService`) — вызывается только командами
 //!   `install-service`/`uninstall-service` приложения, человеком, с UAC;
+//!   `uninstall` дополнительно возвращает адаптер на DHCP, если служба
+//!   владела статикой (ревью round 2, Important №8) — после `DeleteService`
+//!   вернуть её больше некому;
+//! - [`exec`] — единственное место в крейте, которое реально запускает
+//!   `netsh`, с таймаутом и проверкой кода возврата; делят `main.rs` и
+//!   `install::uninstall`.
 //!
 //! `main.rs` (двоичная цель `proxypilot-netsvc`, не часть библиотеки) —
 //! вход SCM: `StartServiceCtrlDispatcherW`, обработчик управления, главный
@@ -42,6 +48,7 @@
 //! `main.rs`).
 
 pub mod adapter;
+pub mod exec;
 pub mod install;
 pub mod netsh_cmd;
 pub mod profile;

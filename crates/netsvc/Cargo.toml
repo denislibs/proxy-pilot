@@ -6,7 +6,7 @@ version.workspace = true
 
 # Библиотека несёт всё проверяемое (разбор profile.toml, формирование
 # команд netsh, страховка отката, установка/удаление службы) — двоичный
-# файл только связывает это со входом SCM (`service.rs`), который
+# файл только связывает это со входом SCM (`src/main.rs`), который
 # автотестами не достижим никак: он либо запущен диспетчером служб
 # Windows, либо не запускается вовсе (см. `CLAUDE.md`, «Живые проверки,
 # которые не делает агент» — установка службы туда входит явно).
@@ -29,8 +29,6 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
-directories = { workspace = true }
-windows-core = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -42,7 +40,14 @@ windows = { workspace = true, features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     # Служба: StartServiceCtrlDispatcherW, RegisterServiceCtrlHandlerExW,
-    # SetServiceStatus, CreateServiceW/DeleteServiceW (install.rs, service.rs).
+    # SetServiceStatus, CreateServiceW/DeleteService (install.rs, src/main.rs).
     "Win32_System_Services",
     "Win32_System_SystemServices",
+    # `OpenProcess`/`TerminateProcess` — принудительная остановка зависшего
+    # `netsh` по таймауту (`exec.rs`).
+    "Win32_System_Threading",
+    # DACL на `%ProgramData%\ProxyPilot` при установке (ревью round 2,
+    # Important №9): SYSTEM и Administrators — запись, Users — чтение.
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }

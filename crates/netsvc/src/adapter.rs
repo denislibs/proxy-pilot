@@ -1,5 +1,6 @@
-//! Сопоставление GUID офисной сети (NLM) с псевдонимом адаптера, которого
-//! ожидает `netsh interface ipv4 ... name=`.
+//! Сопоставление GUID офисной сети (NLM) с адаптером, а также чтение
+//! текущего IPv4-состояния адаптера и его «дружественного» имени — того,
+//! что ожидает `netsh interface ipv4 ... name=`.
 //!
 //! Адаптер для применения статики берётся **из NLM-подключения к офисной
 //! сети, а не по имени службы** (`docs/design.md` §6.4/7.2) — док-станции
@@ -11,15 +12,27 @@
 //!   подключения есть сеть (`GetNetwork` → `GetNetworkId`, тот самый GUID,
 //!   что хранится в `ServiceProfile::office_networks`) и адаптер
 //!   (`GetAdapterId`, GUID адаптера);
-//! - `GetAdaptersAddresses` (IP Helper) — по GUID адаптера отдаёт его
-//!   «дружественное имя» (`FriendlyName`), то самое, что видно в панели
-//!   управления и что понимает `netsh ... name=`.
+//! - `GetAdaptersAddresses` (IP Helper) — по GUID адаптера (`AdapterName`)
+//!   отдаёт его текущее IPv4-состояние и «дружественное имя»
+//!   (`FriendlyName`), то самое, что видно в панели управления и что
+//!   понимает `netsh ... name=`.
+//!
+//! **Идентичность адаптера — GUID, не `FriendlyName`.** Ревью round 2
+//! (задача 6) нашло дыру: раньше `NlmAdapter`/`AppliedState` несли именно
+//! дружественное имя, а оно, как задача 3 уже установила для алиасов
+//! интерфейсов, переименовываемо человеком в любой момент — в том числе в
+//! окне между применением статики и попыткой её откатить. GUID адаптера
+//! Windows не меняет никогда; `find_office_adapter` и
+//! `state::AppliedState::iface_guid` несут именно его, а `FriendlyName`
+//! резолвится заново, непосредственно перед тем, как понадобится для
+//! самой команды `netsh` (`friendly_name_for_guid`).
 //!
 //! `find_office_adapter` — чистая функция сопоставления, полностью
 //! покрытая тестами на фикстурах. Сбор данных с живой машины
-//! (`gather_from_nlm`) — тонкая обёртка над COM/IP Helper без собственной
-//! логики выбора; она читает сеть, ничего не меняя, поэтому проверяется
-//! только смоук-тестом на этой машине, тем же приёмом, что и
+//! (`gather_from_nlm`, `current_ipv4_config`, `friendly_name_for_guid`) —
+//! тонкие обёртки над COM/IP Helper без собственной логики выбора; они
+//! читают сеть, ничего не меняя, поэтому проверяются только смоук-тестами
+//! на этой машине, тем же приёмом, что и
 //! `winnet::networks::list_connected`.
 
 use std::collections::HashMap;
@@ -28,7 +41,7 @@ use std::net::Ipv4Addr;
 use proxypilot_core::net::mask_of;
 use proxypilot_winnet::networks::format_guid;
 use windows::core::Error as WinError;
-use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
     IP_ADAPTER_DHCP_ENABLED,
@@ -39,6 +52,15 @@ use windows::Win32::Networking::NetworkListManager::{
 use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
+/// Сколько раз повторить чтение `GetAdaptersAddresses` при
+/// `ERROR_BUFFER_OVERFLOW`, прежде чем считать это отказом. Документация
+/// Microsoft предупреждает, что теоретически возможна гонка (адаптер
+/// появляется между попытками, и запрошенного размера снова не хватает) и
+/// рекомендует несколько попыток, а не бесконечный цикл — без предела
+/// патологический случай на живой машине превратил бы чтение сети в
+/// зависание потока, крутящего единственный цикл службы.
+const MAX_GET_ADAPTERS_ATTEMPTS: u32 = 3;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error("ошибка Windows: {0}")]
@@ -48,19 +70,23 @@ pub enum AdapterError {
 }
 
 /// Один адаптер, каким его видит связка NLM + IP Helper: сеть, к которой
-/// он подключён, и «дружественное» имя подключения.
+/// он подключён, GUID самого адаптера и его текущее дружественное имя.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NlmAdapter {
     /// GUID сети NLM в канонической форме — сравнивается с
     /// `ServiceProfile::office_networks[i].id`.
     pub network_id: String,
-    /// То, что ожидает `netsh interface ipv4 ... name=`.
+    /// GUID адаптера (`AdapterName` в терминах IP Helper) — устойчивый
+    /// идентификатор, не меняющийся при переименовании подключения.
+    pub adapter_guid: String,
+    /// То, что ожидает `netsh interface ipv4 ... name=` ПРЯМО СЕЙЧАС — не
+    /// хранится нигде дольше одного цикла (докблок модуля).
     pub friendly_name: String,
 }
 
-/// Находит псевдоним адаптера, подключённого к сети с данным GUID.
-/// Сравнение регистронезависимое — GUID из NLM и из `profile.toml` могут
-/// отличаться регистром (тот же довод, что и `Config::place_for` в core, и
+/// Находит GUID адаптера, подключённого к сети с данным GUID. Сравнение
+/// регистронезависимое — GUID из NLM и из `profile.toml` могут отличаться
+/// регистром (тот же довод, что и `Config::place_for` в core, и
 /// `tunnel_state::same_alias` в `winnet`).
 pub fn find_office_adapter<'a>(
     adapters: &'a [NlmAdapter],
@@ -69,7 +95,7 @@ pub fn find_office_adapter<'a>(
     adapters
         .iter()
         .find(|a| a.network_id.eq_ignore_ascii_case(office_network_id))
-        .map(|a| a.friendly_name.as_str())
+        .map(|a| a.adapter_guid.as_str())
 }
 
 /// IPv4-состояние одного адаптера, как его сейчас видит `GetAdaptersAddresses`
@@ -128,6 +154,7 @@ pub fn gather_from_nlm() -> Result<Vec<NlmAdapter>, AdapterError> {
         if let Some(friendly_name) = friendly_names.get(&adapter_guid.to_uppercase()) {
             out.push(NlmAdapter {
                 network_id,
+                adapter_guid,
                 friendly_name: friendly_name.clone(),
             });
         }
@@ -135,19 +162,40 @@ pub fn gather_from_nlm() -> Result<Vec<NlmAdapter>, AdapterError> {
     Ok(out)
 }
 
-/// Текущее IPv4-состояние адаптера по его дружественному имени
-/// (`FriendlyName`, то же, что несёт `NlmAdapter::friendly_name` и что
-/// ожидает `netsh ... name=`). `Ok(None)` — адаптера с таким именем сейчас
-/// нет в `GetAdaptersAddresses`: не ошибка, а законный исход (адаптер
-/// отключили физически между опознанием сети и применением статики).
-pub fn current_ipv4_config(friendly_name: &str) -> Result<Option<CurrentIpv4Config>, AdapterError> {
+/// Текущее дружественное имя адаптера по его GUID — то, что нужно ПРЯМО
+/// СЕЙЧАС для команды `netsh ... name=` (докблок модуля: имя не хранится
+/// между циклами, только резолвится заново). `Ok(None)` — адаптера с таким
+/// GUID сейчас нет: не ошибка (адаптер мог физически исчезнуть), а
+/// законный исход, который обязан обработать вызывающий.
+pub fn friendly_name_for_guid(guid: &str) -> Result<Option<String>, AdapterError> {
+    let guid_upper = guid.to_uppercase();
     for_each_adapter(|adapter| {
-        // SAFETY: `adapter.FriendlyName` — живой PWSTR внутри буфера,
+        // SAFETY: `AdapterName` — живой PSTR (ANSI) внутри буфера,
+        // которым владеет `for_each_adapter`, действителен на всё время
+        // этого замыкания.
+        let name = unsafe { adapter.AdapterName.to_string() }.unwrap_or_default();
+        if name.to_uppercase() != guid_upper {
+            return None;
+        }
+        // SAFETY: `FriendlyName` — тот же буфер, тот же довод.
+        Some(unsafe { adapter.FriendlyName.to_string() }.unwrap_or_default())
+    })
+}
+
+/// Текущее IPv4-состояние адаптера по его GUID (`AdapterName` в терминах
+/// IP Helper) — устойчивому идентификатору, не дружественному имени
+/// (докблок модуля). `Ok(None)` — адаптера с таким GUID сейчас нет в
+/// `GetAdaptersAddresses`: не ошибка, а законный исход (адаптер отключили
+/// физически между опознанием сети и применением статики).
+pub fn current_ipv4_config(guid: &str) -> Result<Option<CurrentIpv4Config>, AdapterError> {
+    let guid_upper = guid.to_uppercase();
+    for_each_adapter(|adapter| {
+        // SAFETY: `adapter.AdapterName` — живой PSTR внутри буфера,
         // которым владеет вызывающий (`for_each_adapter`); `to_string()`
         // копирует данные в собственную `String`, ничего не удерживая после
         // возврата.
-        let name = unsafe { adapter.FriendlyName.to_string() }.unwrap_or_default();
-        if name != friendly_name {
+        let name = unsafe { adapter.AdapterName.to_string() }.unwrap_or_default();
+        if name.to_uppercase() != guid_upper {
             return None;
         }
         // SAFETY: `Anonymous2` — union из одного `u32`-поля (`Flags`) во
@@ -240,9 +288,10 @@ fn adapter_friendly_names_by_guid() -> Result<HashMap<String, String>, AdapterEr
 
 /// Общий каркас чтения `GetAdaptersAddresses`: растущий буфер (Win32
 /// `ERROR_BUFFER_OVERFLOW` — сигнал «дай буфер больше», а не отказ) и обход
-/// связного списка адаптеров. Обе функции выше (`current_ipv4_config`,
-/// `adapter_friendly_names_by_guid`) — просто разные тела для одного и того
-/// же каркаса, чтобы сам каркас (и его SAFETY) не расходился в двух копиях.
+/// связного списка адаптеров. Функции выше (`current_ipv4_config`,
+/// `friendly_name_for_guid`, `adapter_friendly_names_by_guid`) — просто
+/// разные тела для одного и того же каркаса, чтобы сам каркас (и его
+/// SAFETY) не расходился в трёх копиях.
 fn for_each_adapter<T>(
     mut visit: impl FnMut(&IP_ADAPTER_ADDRESSES_LH) -> Option<T>,
 ) -> Result<Option<T>, AdapterError> {
@@ -261,31 +310,50 @@ fn for_each_adapter_ref(
     // 15 КиБ — типичный стартовый размер из документации Microsoft для
     // `GetAdaptersAddresses`: хватает почти всегда с первого раза, а цикл
     // ниже всё равно корректно досчитывает буфер под настоящий размер
-    // машины, если адаптеров окажется больше.
-    let mut size: u32 = 15 * 1024;
-    let mut buf: Vec<u8>;
+    // машины, если адаптеров окажется больше (в пределах
+    // `MAX_GET_ADAPTERS_ATTEMPTS`).
+    let mut byte_capacity: u32 = 15 * 1024;
+    // `Vec<u64>`, а не `Vec<u8>` — ревью round 2 нашло здесь неопределённое
+    // поведение по букве стандарта: `IP_ADAPTER_ADDRESSES_LH` несёt
+    // указательные и `u64`-поля и требует выравнивания 8 байт, а `Vec<u8>`
+    // гарантирует только выравнивание 1. Раньше это «работало» только
+    // потому, что аллокатор Windows на практике отдаёт блоки такого
+    // размера уже выровненными — везение реализации, не гарантия языка.
+    // `Vec<u64>` даёт выравнивание 8 честно, самим типом элемента.
+    let mut buf: Vec<u64>;
+    let mut attempts = 0u32;
     loop {
-        buf = vec![0u8; size as usize];
+        attempts += 1;
+        let words = (byte_capacity as usize).div_ceil(8);
+        buf = vec![0u64; words];
+        let mut size_arg = (words * 8) as u32;
         // SAFETY: `buf` — живой, только что выделенный буфер размера
-        // `size`; `family = AF_UNSPEC (0)` просит и IPv4, и IPv6 (нужен
-        // только IPv4, но фильтрация — дело вызывающего замыкания, не
-        // самого чтения); `size` передаётся и как вход (размер буфера), и
-        // как выход (сколько байт нужно, если буфер мал).
+        // `size_arg` байт, выровненный на 8 (тип элемента `u64`);
+        // `family = 0` (`AF_UNSPEC`) просит и IPv4, и IPv6 (нужен только
+        // IPv4, но фильтрация — дело вызывающего замыкания, не самого
+        // чтения); `size_arg` передаётся и как вход (размер буфера), и как
+        // выход (сколько байт нужно, если буфер мал).
         let rc = unsafe {
             GetAdaptersAddresses(
                 0,
                 GET_ADAPTERS_ADDRESSES_FLAGS(0),
                 None,
                 Some(buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
-                &mut size,
+                &mut size_arg,
             )
         };
         if rc == ERROR_SUCCESS.0 {
             break;
         }
-        if rc == ERROR_BUFFER_OVERFLOW.0 {
-            // `size` уже переписан настоящим нужным значением — следующая
-            // итерация выделяет буфер точного размера.
+        if rc == ERROR_NO_DATA.0 {
+            // Ни одного адаптера в системе вообще — законный исход (машина
+            // без единой сетевой карты), не отказ. Обходить нечего.
+            return Ok(());
+        }
+        if rc == ERROR_BUFFER_OVERFLOW.0 && attempts < MAX_GET_ADAPTERS_ATTEMPTS {
+            // `size_arg` уже переписан настоящим нужным значением —
+            // следующая итерация выделяет буфер точного размера.
+            byte_capacity = size_arg;
             continue;
         }
         return Err(AdapterError::GetAdaptersAddresses(rc));
@@ -307,9 +375,10 @@ fn for_each_adapter_ref(
 mod tests {
     use super::*;
 
-    fn adapter(network_id: &str, friendly_name: &str) -> NlmAdapter {
+    fn adapter(network_id: &str, adapter_guid: &str, friendly_name: &str) -> NlmAdapter {
         NlmAdapter {
             network_id: network_id.to_string(),
+            adapter_guid: adapter_guid.to_string(),
             friendly_name: friendly_name.to_string(),
         }
     }
@@ -317,16 +386,28 @@ mod tests {
     #[test]
     fn finds_the_adapter_connected_to_the_office_network() {
         let adapters = vec![
-            adapter("{BBBB0000-0000-0000-0000-000000000000}", "Домашний Wi-Fi"),
-            adapter("{AAAA0000-0000-0000-0000-000000000001}", "Ethernet 2"),
+            adapter(
+                "{BBBB0000-0000-0000-0000-000000000000}",
+                "{EEEE0000-0000-0000-0000-000000000000}",
+                "Домашний Wi-Fi",
+            ),
+            adapter(
+                "{AAAA0000-0000-0000-0000-000000000001}",
+                "{FFFF0000-0000-0000-0000-000000000001}",
+                "Ethernet 2",
+            ),
         ];
         let got = find_office_adapter(&adapters, "{AAAA0000-0000-0000-0000-000000000001}");
-        assert_eq!(got, Some("Ethernet 2"));
+        assert_eq!(got, Some("{FFFF0000-0000-0000-0000-000000000001}"));
     }
 
     #[test]
     fn no_matching_network_is_none() {
-        let adapters = vec![adapter("{BBBB0000-0000-0000-0000-000000000000}", "Wi-Fi")];
+        let adapters = vec![adapter(
+            "{BBBB0000-0000-0000-0000-000000000000}",
+            "{EEEE0000-0000-0000-0000-000000000000}",
+            "Wi-Fi",
+        )];
         assert_eq!(
             find_office_adapter(&adapters, "{AAAA0000-0000-0000-0000-000000000001}"),
             None
@@ -347,11 +428,12 @@ mod tests {
         // довод, что и `Config::matching_is_case_insensitive` в core.
         let adapters = vec![adapter(
             "{aaaa0000-0000-0000-0000-000000000001}",
+            "{FFFF0000-0000-0000-0000-000000000001}",
             "Ethernet 2",
         )];
         assert_eq!(
             find_office_adapter(&adapters, "{AAAA0000-0000-0000-0000-000000000001}"),
-            Some("Ethernet 2")
+            Some("{FFFF0000-0000-0000-0000-000000000001}")
         );
     }
 
@@ -361,13 +443,25 @@ mod tests {
         // имени: несколько адаптеров подключены одновременно (докблок
         // модуля), верно выбирается тот, что несёт офисную сеть.
         let adapters = vec![
-            adapter("{CCCC0000-0000-0000-0000-000000000000}", "Гостевая"),
-            adapter("{AAAA0000-0000-0000-0000-000000000001}", "USB-C Ethernet"),
-            adapter("{DDDD0000-0000-0000-0000-000000000000}", "Wi-Fi"),
+            adapter(
+                "{CCCC0000-0000-0000-0000-000000000000}",
+                "{1111-guest}",
+                "Гостевая",
+            ),
+            adapter(
+                "{AAAA0000-0000-0000-0000-000000000001}",
+                "{FFFF0000-0000-0000-0000-000000000001}",
+                "USB-C Ethernet",
+            ),
+            adapter(
+                "{DDDD0000-0000-0000-0000-000000000000}",
+                "{2222-wifi}",
+                "Wi-Fi",
+            ),
         ];
         assert_eq!(
             find_office_adapter(&adapters, "{AAAA0000-0000-0000-0000-000000000001}"),
-            Some("USB-C Ethernet")
+            Some("{FFFF0000-0000-0000-0000-000000000001}")
         );
     }
 
@@ -397,39 +491,59 @@ mod tests {
 
     #[test]
     fn reading_current_ipv4_config_of_a_nonexistent_adapter_is_none_not_an_error() {
-        let got = current_ipv4_config("совершенно точно нет такого адаптера на этой машине")
+        let got = current_ipv4_config("{00000000-0000-0000-0000-000000000000}")
             .expect("чтение не должно падать даже без совпадения");
         assert_eq!(got, None);
     }
 
     #[test]
-    fn reading_current_ipv4_config_does_not_fail_for_a_real_connected_adapter() {
-        // Берём реальный адаптер этой машины через тот же путь, что и
-        // `gather_from_nlm` (IP Helper напрямую, без NLM) — если сеть вообще
-        // подключена, у машины обязан быть хотя бы один адаптер с DHCP-флагом
-        // или статикой; если нет вовсе — тест пропускает себя, а не падает.
-        let mut any_named = None;
+    fn resolving_friendly_name_of_a_nonexistent_adapter_is_none_not_an_error() {
+        let got = friendly_name_for_guid("{00000000-0000-0000-0000-000000000000}")
+            .expect("чтение не должно падать даже без совпадения");
+        assert_eq!(got, None);
+    }
+
+    /// Находит GUID любого реального адаптера этой машины напрямую через IP
+    /// Helper (без NLM) — общий помощник для двух смоук-тестов ниже.
+    fn any_real_adapter_guid() -> Option<String> {
+        let mut found = None;
         for_each_adapter_ref(|a| {
-            if any_named.is_none() {
-                // SAFETY: `FriendlyName` — живой PWSTR внутри буфера,
+            if found.is_none() {
+                // SAFETY: `AdapterName` — живой PSTR внутри буфера,
                 // действителен на всё время этого замыкания.
-                if let Ok(name) = unsafe { a.FriendlyName.to_string() } {
+                if let Ok(name) = unsafe { a.AdapterName.to_string() } {
                     if !name.is_empty() {
-                        any_named = Some(name);
+                        found = Some(name);
                     }
                 }
             }
         })
         .expect("перечисление адаптеров не должно падать");
+        found
+    }
 
-        let Some(name) = any_named else {
-            eprintln!("на машине не нашлось ни одного именованного адаптера — тест пропущен");
+    #[test]
+    fn reading_current_ipv4_config_does_not_fail_for_a_real_connected_adapter() {
+        // Если сеть вообще подключена, у машины обязан быть хотя бы один
+        // адаптер; если нет вовсе — тест пропускает себя, а не падает.
+        let Some(guid) = any_real_adapter_guid() else {
+            eprintln!("на машине не нашлось ни одного адаптера — тест пропущен");
             return;
         };
-        let got = current_ipv4_config(&name).expect("чтение не должно падать");
+        let got = current_ipv4_config(&guid).expect("чтение не должно падать");
+        assert!(got.is_some(), "адаптер с найденным GUID обязан прочитаться");
+    }
+
+    #[test]
+    fn resolving_friendly_name_does_not_fail_for_a_real_connected_adapter() {
+        let Some(guid) = any_real_adapter_guid() else {
+            eprintln!("на машине не нашлось ни одного адаптера — тест пропущен");
+            return;
+        };
+        let got = friendly_name_for_guid(&guid).expect("чтение не должно падать");
         assert!(
             got.is_some(),
-            "адаптер с найденным именем обязан прочитаться"
+            "адаптер с найденным GUID обязан резолвиться в имя"
         );
     }
 }

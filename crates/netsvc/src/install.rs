@@ -24,7 +24,16 @@
 
 use std::path::Path;
 
-use windows::core::{Error as WinError, PCWSTR};
+use windows::core::{w, Error as WinError, HRESULT, PCWSTR};
+use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL, NO_ERROR};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
+};
 use windows::Win32::System::Services::{
     CloseServiceHandle, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, SC_HANDLE,
     SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
@@ -43,6 +52,10 @@ pub enum InstallError {
     OpenService(WinError),
     #[error("не удалось удалить службу {SERVICE_NAME}: {0}")]
     Delete(WinError),
+    #[error("не удалось создать {0:?}: {1}")]
+    CreateDir(std::path::PathBuf, std::io::Error),
+    #[error("не удалось выставить права доступа на каталог данных службы: {0}")]
+    Acl(WinError),
 }
 
 /// UTF-16 строка с завершающим нулём — обязательный формат для `PCWSTR`.
@@ -78,10 +91,101 @@ impl Drop for ScHandleGuard {
     }
 }
 
+/// Создаёт `%ProgramData%\ProxyPilot` (если его ещё нет) и ставит на него
+/// явный защищённый DACL: SYSTEM и встроенные администраторы — полный
+/// доступ, встроенные пользователи — только чтение.
+///
+/// Ревью round 2 (задача 6), Important №9: без этого каталог наследует ACE
+/// родителя — `%ProgramData%` по умолчанию даёт запись группе `Users` — а
+/// именно здесь лежат `profile.toml` и `applied.toml`, которые читает
+/// системная служба. Незащищённый каталог был бы ровно тем каналом
+/// подмены, ради закрытия которого сама служба и написана (докблок
+/// крейта — «читать пользовательский файл значило бы дать кому угодно
+/// диктовать сетевые настройки системной службе»; открытый на запись
+/// каталог ProgramData — тот же дефект под другим именем). Вызывается из
+/// `install`, который и так уже требует администратора — второго UAC это
+/// не добавляет.
+fn secure_program_data_dir() -> Result<(), InstallError> {
+    let dir = crate::profile::program_data_dir().join("ProxyPilot");
+    std::fs::create_dir_all(&dir).map_err(|e| InstallError::CreateDir(dir.clone(), e))?;
+
+    // D:P — защищённый DACL (не наследует ACE родителя); SY — LocalSystem,
+    // BA — встроенные администраторы (полный доступ, FA), BU — встроенные
+    // пользователи (только чтение, FR). OICI — наследуется файлами и
+    // подкаталогами, которые появятся здесь позже (`logs\`).
+    let sddl = w!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)");
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` — статическая, корректно завершённая нулём
+    // wide-строка; `descriptor` — живая переменная, которую функция
+    // заполняет указателем на память, выделенную ЕЮ САМОЙ (освобождается
+    // ниже через `LocalFree` — так документирована эта функция).
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl,
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(InstallError::Acl)?;
+
+    let mut dacl_present = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = BOOL(0);
+    // SAFETY: `descriptor` — валидный дескриптор, только что созданный
+    // выше; три указателя на выходные параметры — живые локальные
+    // переменные. Сам DACL, который эта функция отдаёт через `dacl`, —
+    // часть памяти `descriptor`, а не отдельная аллокация: освобождать его
+    // отдельно не нужно и нельзя, только весь `descriptor` целиком ниже.
+    let dacl_lookup = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+
+    let result = dacl_lookup.and_then(|()| {
+        // SAFETY: `dir_wide` жива до конца этого вызова; `dacl` указывает
+        // внутрь `descriptor`, который жив до `LocalFree` ниже, то есть до
+        // конца этой функции — переживает сам вызов `SetNamedSecurityInfoW`.
+        let dir_wide = wide(&dir.display().to_string());
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR::from_raw(dir_wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl as *const ACL),
+                None,
+            )
+        };
+        if rc == NO_ERROR {
+            Ok(())
+        } else {
+            Err(WinError::from_hresult(HRESULT::from_win32(rc.0)))
+        }
+    });
+
+    // SAFETY: `descriptor.0` получен от
+    // `ConvertStringSecurityDescriptorToSecurityDescriptorW` выше,
+    // документация которой прямо предписывает освобождать его именно
+    // `LocalFree`; используется здесь в последний раз, независимо от
+    // исхода вызовов выше — освобождение не должно зависеть от того,
+    // удался ли `SetNamedSecurityInfoW`.
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0)) };
+
+    result.map_err(InstallError::Acl)
+}
+
 /// Регистрирует службу `ProxyPilotNetProfile`, запускающую `exe_path` при
 /// каждой загрузке Windows от LocalSystem. См. докблок модуля про то,
 /// почему это не запускает саму службу.
 pub fn install(exe_path: &Path) -> Result<(), InstallError> {
+    secure_program_data_dir()?;
+
     // SAFETY: оба параметра машины/базы — `PCWSTR::null()`, что означает
     // «эта машина, база SERVICES_ACTIVE_DATABASE по умолчанию»;
     // запрошенные права — минимум, достаточный для `CreateServiceW` ниже.
@@ -125,12 +229,70 @@ pub fn install(exe_path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
-/// Снимает регистрацию службы. Не останавливает её, если она в этот момент
-/// запущена (`ControlService`/`StopService` здесь не вызываются) — SCM сам
-/// помечает службу к удалению и убирает запись, когда последний открытый
-/// хендл на неё закроется; человек, вызвавший `uninstall-service` на живой
-/// службе, увидит это поведение SCM как есть, а не подмену от нас.
+/// Если служба когда-то поставила статику, возвращает адаптер на DHCP —
+/// последний шанс это сделать: после `DeleteService` ниже возвращать
+/// станет некому. Ревью round 2 (задача 6), Important №8 — с явной
+/// оговоркой контроллера: `stop` НЕ обязан откатывать (это обычно просто
+/// перезагрузка, и профиль применится заново при следующем старте), но
+/// `uninstall` обязан, потому что для него следующего раза не будет —
+/// ноутбук, покинувший офис уже без службы, держал бы офисную статику
+/// вечно.
+///
+/// Печатает результат в stdout/stderr, а не логирует через `tracing`: это
+/// разовая команда человека из терминала (`uninstall-service`), а не
+/// операционный журнал службы, и подписчика `tracing` здесь никто не
+/// поднимал (докблок `crates/app/src/main.rs`).
+fn revert_to_dhcp_before_removal() {
+    let applied = crate::state::load_from(&crate::state::path());
+    let (Some(_ip), Some(guid)) = (applied.ip, applied.iface_guid.as_deref()) else {
+        // Мы ничего не ставили (или уже откатили раньше) — сети трогать
+        // нечего.
+        return;
+    };
+    match crate::adapter::friendly_name_for_guid(guid) {
+        Ok(Some(alias)) => {
+            let cmds = crate::netsh_cmd::dhcp_restore_commands(&alias);
+            if crate::exec::run_netsh_batch(cmds) {
+                let _ = crate::state::save_to(
+                    &crate::state::path(),
+                    &crate::state::AppliedState::default(),
+                );
+                println!("Адаптер «{alias}» возвращён на DHCP перед удалением службы.");
+            } else {
+                eprintln!(
+                    "ВНИМАНИЕ: не удалось вернуть адаптер «{alias}» на DHCP перед удалением \
+                     службы. Сделайте это вручную: netsh interface ipv4 set address \
+                     name=\"{alias}\" source=dhcp && netsh interface ipv4 set dnsservers \
+                     name=\"{alias}\" source=dhcp"
+                );
+            }
+        }
+        Ok(None) => {
+            eprintln!(
+                "ВНИМАНИЕ: служба помнит применённую статику, но адаптер с GUID {guid} \
+                 сейчас не найден — проверьте сетевые настройки вручную перед удалением \
+                 службы."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "ВНИМАНИЕ: не удалось определить адаптер для отката DHCP перед удалением \
+                 службы: {e}. Проверьте сетевые настройки вручную."
+            );
+        }
+    }
+}
+
+/// Снимает регистрацию службы. Перед этим — откат в DHCP, если служба
+/// что-то ставила (`revert_to_dhcp_before_removal`). Не останавливает саму
+/// службу, если она в этот момент запущена (`ControlService`/`StopService`
+/// здесь не вызываются) — SCM сам помечает службу к удалению и убирает
+/// запись, когда последний открытый хендл на неё закроется; человек,
+/// вызвавший `uninstall-service` на живой службе, увидит это поведение SCM
+/// как есть, а не подмену от нас.
 pub fn uninstall() -> Result<(), InstallError> {
+    revert_to_dhcp_before_removal();
+
     // SAFETY: см. `install` — те же предопределённые константы для машины
     // и базы по умолчанию.
     let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
