@@ -57,17 +57,53 @@ const CONFIG_DIR: PCWSTR = w!("config_dir");
 const GUI_EXE_NAME: &str = "openvpn-gui.exe";
 
 /// Найденная установка OpenVPN: путь к GUI-исполняемому файлу (им управляют
-/// `connect`/`disconnect`/`profile_status` ниже) и к каталогу, где лежат
-/// пользовательские `.ovpn`-конфигурации (в него же `install_profile` кладёт
-/// наш собственный профиль).
+/// `connect`/`disconnect`/`profile_status` ниже), системный каталог
+/// конфигураций `config_dir` (из `HKLM\SOFTWARE\OpenVPN\config_dir` или
+/// стандартный `%ProgramFiles%\OpenVPN\config`) и пользовательский
+/// `user_config_dir` (`%USERPROFILE%\OpenVPN\config`).
+///
+/// **Разница между ними — не косметика, а вопрос прав на запись.**
+/// `config_dir` на обычной установке лежит под `Program Files` и открыт на
+/// запись только администратору и `TrustedInstaller` — обычный пользователь
+/// его только читает: там может лежать исходный `.ovpn`, который выдал
+/// администратор сети (сертификаты, адрес сервера), но положить туда файл
+/// самостоятельно, без UAC, он не может. `user_config_dir` — ровно то место,
+/// куда сам OpenVPN GUI сохраняет профили без запроса прав (задокументировано
+/// в собственном README установки OpenVPN и подтверждено на живой машине:
+/// запись тестового файла в `config_dir` отказывает access denied, в
+/// `user_config_dir` — проходит). GUI при этом показывает профили из ОБОИХ
+/// каталогов разом — значит и наше чтение источника (`find_config_file`
+/// ниже) обязано смотреть в оба, а не только в `config_dir`.
+///
+/// `install_profile` ниже пишет исключительно в `user_config_dir` — см. её
+/// докблок.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub gui_exe: PathBuf,
     pub config_dir: PathBuf,
+    pub user_config_dir: PathBuf,
+}
+
+/// То, что `locate` знает сама — координаты установки без обращения к
+/// `%USERPROFILE%`. Отдельный от [`Installation`] тип специально: `locate`
+/// остаётся чистой функцией с теми же аргументами, что и раньше (ради тех
+/// же тестов), а резолв `user_config_dir`, который умеет ОТКАЗЫВАТЬ
+/// (`WinNetError::UserProfileNotFound`), происходит только в
+/// `find_installation` — и только когда установка вообще найдена: машине
+/// без OpenVPN не с чего спотыкаться о переменную окружения, которая ей не
+/// понадобится.
+struct SystemPaths {
+    gui_exe: PathBuf,
+    config_dir: PathBuf,
 }
 
 /// Ищет установленный OpenVPN. `Ok(None)` — не установлен; это не ошибка,
-/// а такой же законный исход, как «установлен».
+/// а такой же законный исход, как «установлен». Если установка найдена, но
+/// `%USERPROFILE%` не резолвится — это уже `Err`
+/// (`WinNetError::UserProfileNotFound`, докблок [`Installation`]): без него
+/// `install_profile` ниже не знает, куда обязана писать, и подставлять
+/// вместо него `config_dir` означало бы гарантированный access denied чуть
+/// позже вместо честного отказа здесь и сейчас.
 pub fn find_installation() -> Result<Option<Installation>, WinNetError> {
     let (bin_dir_value, config_dir_value) = match open_key(SUBKEY)? {
         Some(key) => read_registry_values(&key)?,
@@ -76,11 +112,28 @@ pub fn find_installation() -> Result<Option<Installation>, WinNetError> {
         // расположения, а не считать установку найденной по совпадению.
         None => (String::new(), String::new()),
     };
-    Ok(locate(
-        &bin_dir_value,
-        &config_dir_value,
-        &program_files_dir(),
-    ))
+    let Some(found) = locate(&bin_dir_value, &config_dir_value, &program_files_dir()) else {
+        return Ok(None);
+    };
+    let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    Ok(Some(Installation {
+        gui_exe: found.gui_exe,
+        config_dir: found.config_dir,
+        user_config_dir: resolve_user_config_dir(user_profile)?,
+    }))
+}
+
+/// Вычисляет `user_config_dir` из уже прочитанного (или отсутствующего)
+/// `%USERPROFILE%` — чистая функция ради теста
+/// (`resolve_user_config_dir_fails_clearly_when_userprofile_is_unset`):
+/// подставлять реальное окружение процесса в тест значило бы либо трогать
+/// настоящий профиль пользователя этой машины, либо мутировать глобальную
+/// переменную окружения параллельно с другими тестами. `None` — тот самый
+/// редкий, но реальный случай (служба, нестандартная среда запуска), когда
+/// переменной в окружении процесса нет вовсе.
+fn resolve_user_config_dir(user_profile: Option<PathBuf>) -> Result<PathBuf, WinNetError> {
+    let profile = user_profile.ok_or(WinNetError::UserProfileNotFound)?;
+    Ok(profile.join("OpenVPN").join("config"))
 }
 
 /// Читает `bin_dir` и `config_dir` из уже открытого ключа, в этом порядке.
@@ -147,14 +200,15 @@ fn standard_config_dir(program_files: &Path) -> PathBuf {
 /// `gui_exe` обязан существовать как файл — иначе `None`: ключ реестра,
 /// оставленный деинсталлятором, или стандартный путь без установки не
 /// должны выглядеть как рабочая установка. Для `config_dir` та же проверка
-/// не нужна: отсутствующий каталог конфигураций — это просто «конфигураций
-/// пока нет», а не «OpenVPN не установлен»; `install_profile` ниже создаёт
-/// его сама при необходимости.
+/// не нужна: отсутствующий системный каталог конфигураций — это просто
+/// «администратор там пока ничего не оставил», а не «OpenVPN не
+/// установлен» — этот каталог только читается (докблок [`Installation`]),
+/// и `install_profile` в него не пишет и не создаёт его.
 fn locate(
     bin_dir_value: &str,
     config_dir_value: &str,
     program_files: &Path,
-) -> Option<Installation> {
+) -> Option<SystemPaths> {
     let bin_dir = if bin_dir_value.is_empty() {
         standard_bin_dir(program_files)
     } else {
@@ -170,7 +224,7 @@ fn locate(
     if !gui_exe.is_file() {
         return None;
     }
-    Some(Installation {
+    Some(SystemPaths {
         gui_exe,
         config_dir,
     })
@@ -197,25 +251,43 @@ fn ensure_still_installed(inst: &Installation) -> Result<(), WinNetError> {
     Ok(())
 }
 
-/// Путь к нашему профилю в каталоге конфигураций OpenVPN. `name` — то же
-/// самое значение, что уходит в `--command connect|disconnect <name>`
-/// (`build_gui_command`, спека 8.3): один параметр на оба места, а не два
-/// независимых имени (файла и команды), которые могли бы разойтись.
+/// Путь к нашему профилю в ПОЛЬЗОВАТЕЛЬСКОМ каталоге конфигураций OpenVPN
+/// (`user_config_dir`, не `config_dir` — докблок [`Installation`]). `name`
+/// — то же самое значение, что уходит в `--command connect|disconnect
+/// <name>` (`build_gui_command`, спека 8.3): один параметр на оба места, а
+/// не два независимых имени (файла и команды), которые могли бы
+/// разойтись.
 fn profile_path(inst: &Installation, name: &str) -> PathBuf {
-    inst.config_dir.join(format!("{name}.{PROFILE_EXTENSION}"))
+    inst.user_config_dir
+        .join(format!("{name}.{PROFILE_EXTENSION}"))
 }
 
-/// Кладёт готовый текст профиля под собственным именем `name` в каталог
-/// конфигураций OpenVPN. Существующие профили пользователя не читаются,
-/// не перемещаются, не переименовываются и не удаляются — пишется ровно
-/// один файл `<name>.ovpn`, остальное содержимое каталога вообще не
+/// Кладёт готовый текст профиля под собственным именем `name` в
+/// ПОЛЬЗОВАТЕЛЬСКИЙ каталог конфигураций OpenVPN — `inst.user_config_dir`,
+/// НЕ `inst.config_dir`. Существующие профили пользователя не читаются, не
+/// перемещаются, не переименовываются и не удаляются — пишется ровно один
+/// файл `<name>.ovpn`, остальное содержимое каталога вообще не
 /// просматривается.
 ///
-/// Каталог конфигураций создаётся, если его ещё нет: отсутствие каталога
-/// само по себе не признак «OpenVPN не установлен» (см. докблок `locate`
-/// выше — «конфигураций пока нет» это законное состояние), а
-/// `install_profile` вполне может оказаться первым, что кладёт в него
-/// хоть что-то.
+/// **Почему не `config_dir`.** `config_dir` — системный каталог
+/// (`HKLM\SOFTWARE\OpenVPN\config_dir`, на обычной установке — под `Program
+/// Files`) — открыт на запись только администратору и `TrustedInstaller`;
+/// обычный пользователь получает туда только чтение. Прежняя версия этой
+/// функции писала именно туда и предполагала обратное — что каталог
+/// доступен на запись, раз сам OpenVPN GUI сохраняет профили без UAC.
+/// Предположение было по форме правдоподобным и по факту неверным: GUI
+/// действительно сохраняет профили без UAC, но не в `config_dir`, а в
+/// `user_config_dir` (`%USERPROFILE%\OpenVPN\config`) — что и подтвердила
+/// проверка на живой машине (запись пробного файла в `config_dir` отказала
+/// access denied, в `user_config_dir` — прошла). Прав администратора эта
+/// функция по-прежнему не требует: она вообще не пытается писать туда, где
+/// их бы потребовалось.
+///
+/// Пользовательский каталог создаётся, если его ещё нет: отсутствие
+/// каталога само по себе не признак «OpenVPN не установлен» (см. докблок
+/// `locate` выше), а `install_profile` вполне может оказаться первым, что
+/// кладёт в него хоть что-то — как это делает и сам OpenVPN GUI при первом
+/// сохранённом профиле.
 ///
 /// `contents` здесь принимается уже готовым, без проверки, что это вообще
 /// прошло через `ovpn_profile::build_profile`: эта функция не знает и не
@@ -233,8 +305,8 @@ pub fn install_profile(
     contents: &str,
 ) -> Result<PathBuf, WinNetError> {
     ensure_still_installed(inst)?;
-    std::fs::create_dir_all(&inst.config_dir).map_err(|source| WinNetError::ProfileWrite {
-        path: inst.config_dir.clone(),
+    std::fs::create_dir_all(&inst.user_config_dir).map_err(|source| WinNetError::ProfileWrite {
+        path: inst.user_config_dir.clone(),
         source,
     })?;
     let path = profile_path(inst, name);
@@ -243,6 +315,32 @@ pub fn install_profile(
         source,
     })?;
     Ok(path)
+}
+
+/// Ищет файл `filename` среди обоих каталогов конфигураций OpenVPN — сперва
+/// в пользовательском (`user_config_dir`), и только если там пусто — в
+/// системном (`config_dir`). Нужна для чтения ИСХОДНЫХ файлов (например,
+/// `.ovpn` с сертификатами и адресом сервера, из которого
+/// `build_and_install_profile` собирает наш профиль) — `install_profile`
+/// сама по себе только пишет и этой функцией не пользуется.
+///
+/// Явное пользовательское расположение выигрывает нарочно: обычный
+/// пользователь способен положить файл только в `user_config_dir` (в
+/// `config_dir` он может только читать — докблок [`Installation`]), поэтому
+/// если файл почему-то оказался в обоих местах, актуальнее считается тот,
+/// что мог положить сам пользователь только что, а не более старая копия
+/// из системного каталога, которую администратор мог оставить при
+/// установке.
+pub fn find_config_file(inst: &Installation, filename: &str) -> Option<PathBuf> {
+    let user_path = inst.user_config_dir.join(filename);
+    if user_path.is_file() {
+        return Some(user_path);
+    }
+    let system_path = inst.config_dir.join(filename);
+    if system_path.is_file() {
+        return Some(system_path);
+    }
+    None
 }
 
 /// Собирает профиль (`ovpn_profile::build_profile`) и кладёт его под
@@ -544,13 +642,16 @@ mod tests {
     #[test]
     fn finding_the_real_installation_does_not_fail() {
         // Смоук на живой машине: OpenVPN может быть установлен или нет —
-        // оба исхода допустимы, отказ (Err) — нет.
+        // оба исхода допустимы, отказ (Err) — нет. Если установлен,
+        // `%USERPROFILE%` на реальной интерактивной сессии Windows всегда
+        // задан, так что `user_config_dir` тоже обязан резолвиться, а не
+        // проваливаться `UserProfileNotFound`.
         let found = find_installation().expect("поиск обязан не падать в любом случае");
         match &found {
             Some(inst) => {
                 println!(
-                    "OpenVPN найден: gui_exe={:?} config_dir={:?}",
-                    inst.gui_exe, inst.config_dir
+                    "OpenVPN найден: gui_exe={:?} config_dir={:?} user_config_dir={:?}",
+                    inst.gui_exe, inst.config_dir, inst.user_config_dir
                 );
                 assert!(
                     inst.gui_exe.is_file(),
@@ -588,24 +689,34 @@ mod tests {
     use std::str::FromStr;
 
     /// `Installation`, чей `gui_exe` заведомо не существует на диске —
-    /// для проверки отказа «OpenVPN не найден».
-    fn fake_installation_with_missing_gui(config_dir: PathBuf) -> Installation {
+    /// для проверки отказа «OpenVPN не найден». `name` рождает два разных
+    /// временных каталога (системный и пользовательский) — им всё равно
+    /// не суждено использоваться дальше `ensure_still_installed`.
+    fn fake_installation_with_missing_gui(name: &str) -> Installation {
+        let config_dir = unique_temp_dir(&format!("{name}-config"));
+        let user_config_dir = unique_temp_dir(&format!("{name}-user-config"));
         Installation {
             gui_exe: config_dir.join("definitely-does-not-exist-openvpn-gui.exe"),
             config_dir,
+            user_config_dir,
         }
     }
 
     /// `Installation` с настоящим (хоть и пустым) файлом на месте
     /// `gui_exe`, чтобы `ensure_still_installed` пропускала её дальше —
-    /// сам файл никогда не запускается.
+    /// сам файл никогда не запускается. Оба каталога конфигураций — под
+    /// `std::env::temp_dir()`, никогда не настоящие `Program Files`/
+    /// `%USERPROFILE%` этой машины (см. `cleanup` ниже про то, почему это
+    /// не просто соглашение, а проверяемое условие).
     fn installation_with_stub_gui(name: &str) -> Installation {
         let bin_dir = unique_temp_dir(&format!("{name}-bin"));
         fs::write(bin_dir.join(GUI_EXE_NAME), b"stub").unwrap();
         let config_dir = unique_temp_dir(&format!("{name}-config"));
+        let user_config_dir = unique_temp_dir(&format!("{name}-user-config"));
         Installation {
             gui_exe: bin_dir.join(GUI_EXE_NAME),
             config_dir,
+            user_config_dir,
         }
     }
 
@@ -623,6 +734,9 @@ mod tests {
         let is_scratch = |p: &Path| p.starts_with(std::env::temp_dir());
         if is_scratch(&inst.config_dir) {
             let _ = fs::remove_dir_all(&inst.config_dir);
+        }
+        if is_scratch(&inst.user_config_dir) {
+            let _ = fs::remove_dir_all(&inst.user_config_dir);
         }
         if let Some(bin_dir) = inst.gui_exe.parent() {
             if is_scratch(bin_dir) {
@@ -666,6 +780,7 @@ mod tests {
         let inst = Installation {
             gui_exe: bin_dir.join(GUI_EXE_NAME),
             config_dir: base.join("Program Files").join("OpenVPN").join("config"),
+            user_config_dir: base.join("Jane Doe").join("OpenVPN").join("config"),
         };
 
         let cmd = build_gui_command(&inst, "connect", "proxypilot-office");
@@ -678,20 +793,18 @@ mod tests {
 
     #[test]
     fn connect_fails_clearly_when_openvpn_is_not_found() {
-        let config_dir = unique_temp_dir("connect-missing-gui");
-        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let inst = fake_installation_with_missing_gui("connect-missing-gui");
         let err = connect(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
         assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
-        let _ = fs::remove_dir_all(&config_dir);
+        cleanup(&inst);
     }
 
     #[test]
     fn disconnect_fails_clearly_when_openvpn_is_not_found() {
-        let config_dir = unique_temp_dir("disconnect-missing-gui");
-        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let inst = fake_installation_with_missing_gui("disconnect-missing-gui");
         let err = disconnect(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
         assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
-        let _ = fs::remove_dir_all(&config_dir);
+        cleanup(&inst);
     }
 
     #[test]
@@ -699,16 +812,47 @@ mod tests {
         let inst = installation_with_stub_gui("install-basic");
         let path = install_profile(&inst, "proxypilot-office", "client\ndev tun\n")
             .expect("запись профиля обязана удаться");
-        assert_eq!(path, inst.config_dir.join("proxypilot-office.ovpn"));
+        assert_eq!(path, inst.user_config_dir.join("proxypilot-office.ovpn"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "client\ndev tun\n");
+        // Системный каталог (в жизни — под Program Files, недоступный на
+        // запись обычному пользователю) `installation_with_stub_gui` уже
+        // создал пустым для чистоты теста — install_profile не должен
+        // положить в него ни одного файла.
+        assert_eq!(fs::read_dir(&inst.config_dir).unwrap().count(), 0);
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn install_profile_never_writes_into_the_system_config_dir() {
+        // Даже если системный каталог существует и уже что-то содержит
+        // (как на реальной машине — файл, положенный туда
+        // администратором), install_profile не должен ни писать туда, ни
+        // трогать то, что там уже лежит: запись идёт только в
+        // user_config_dir.
+        let inst = installation_with_stub_gui("install-system-untouched");
+        fs::create_dir_all(&inst.config_dir).unwrap();
+        let system_marker = inst.config_dir.join("admin-placed-profile.ovpn");
+        fs::write(&system_marker, "профиль администратора\n").unwrap();
+
+        install_profile(&inst, "proxypilot-office", "наш профиль\n")
+            .expect("запись обязана удаться");
+
+        assert_eq!(
+            fs::read_to_string(&system_marker).unwrap(),
+            "профиль администратора\n"
+        );
+        assert!(
+            !inst.config_dir.join("proxypilot-office.ovpn").exists(),
+            "наш профиль не должен появляться в системном каталоге"
+        );
         cleanup(&inst);
     }
 
     #[test]
     fn install_profile_does_not_touch_neighbouring_files() {
         let inst = installation_with_stub_gui("install-neighbours");
-        fs::create_dir_all(&inst.config_dir).unwrap();
-        let neighbour = inst.config_dir.join("my-existing-work-profile.ovpn");
+        fs::create_dir_all(&inst.user_config_dir).unwrap();
+        let neighbour = inst.user_config_dir.join("my-existing-work-profile.ovpn");
         fs::write(&neighbour, "исходный пользовательский профиль\n").unwrap();
 
         install_profile(&inst, "proxypilot-office", "наш профиль\n")
@@ -718,7 +862,7 @@ mod tests {
             fs::read_to_string(&neighbour).unwrap(),
             "исходный пользовательский профиль\n"
         );
-        let mut names: Vec<_> = fs::read_dir(&inst.config_dir)
+        let mut names: Vec<_> = fs::read_dir(&inst.user_config_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
@@ -750,34 +894,37 @@ mod tests {
     }
 
     #[test]
-    fn install_profile_round_trips_a_config_dir_with_spaces() {
-        // Обычное место установки — "C:\Program Files\OpenVPN\config":
-        // путь с пробелом в компоненте каталога.
+    fn install_profile_round_trips_a_user_config_dir_with_spaces() {
+        // %USERPROFILE% нередко содержит пробел в имени учётной записи
+        // ("C:\Users\Jane Doe"), а от него наследуется весь путь
+        // "...\OpenVPN\config" — пробел в компоненте пути, не редкий край.
         let base = unique_temp_dir("install-spaces");
         let bin_dir = base.join("Program Files").join("OpenVPN").join("bin");
-        let config_dir = base.join("Program Files").join("OpenVPN").join("config");
+        let user_config_dir = base.join("Jane Doe").join("OpenVPN").join("config");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join(GUI_EXE_NAME), b"stub").unwrap();
         let inst = Installation {
             gui_exe: bin_dir.join(GUI_EXE_NAME),
-            config_dir: config_dir.clone(),
+            config_dir: base.join("Program Files").join("OpenVPN").join("config"),
+            user_config_dir: user_config_dir.clone(),
         };
 
         let path = install_profile(&inst, "proxypilot-office", "содержимое профиля\n")
             .expect("путь с пробелом обязан работать");
-        assert_eq!(path, config_dir.join("proxypilot-office.ovpn"));
+        assert_eq!(path, user_config_dir.join("proxypilot-office.ovpn"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "содержимое профиля\n");
 
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn install_profile_creates_the_config_dir_if_it_does_not_exist_yet() {
+    fn install_profile_creates_the_user_config_dir_if_it_does_not_exist_yet() {
         let inst = installation_with_stub_gui("install-create-dir");
-        // config_dir специально удаляем — как и объяснено в докблоке
-        // `locate` выше, "конфигураций пока нет" не значит "не установлен".
-        fs::remove_dir_all(&inst.config_dir).unwrap();
-        assert!(!inst.config_dir.exists());
+        // user_config_dir специально удаляем — как и объяснено в докблоке
+        // `install_profile`, "конфигураций пока нет" не значит "не
+        // установлен".
+        fs::remove_dir_all(&inst.user_config_dir).unwrap();
+        assert!(!inst.user_config_dir.exists());
 
         let path = install_profile(&inst, "proxypilot-office", "x\n")
             .expect("каталог конфигураций обязан создаться сам");
@@ -787,16 +934,15 @@ mod tests {
 
     #[test]
     fn install_profile_fails_clearly_when_openvpn_is_not_found() {
-        let config_dir = unique_temp_dir("install-missing-gui");
-        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let inst = fake_installation_with_missing_gui("install-missing-gui");
         let err = install_profile(&inst, "proxypilot-office", "x\n")
             .expect_err("gui_exe отсутствует на диске");
         assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
         assert!(
-            !config_dir.join("proxypilot-office.ovpn").exists(),
+            !inst.user_config_dir.join("proxypilot-office.ovpn").exists(),
             "профиль не должен писаться, если установка не подтверждена"
         );
-        let _ = fs::remove_dir_all(&config_dir);
+        cleanup(&inst);
     }
 
     #[test]
@@ -818,12 +964,11 @@ mod tests {
 
     #[test]
     fn profile_status_fails_clearly_when_openvpn_is_not_found() {
-        let config_dir = unique_temp_dir("status-missing-gui");
-        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let inst = fake_installation_with_missing_gui("status-missing-gui");
         let err =
             profile_status(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
         assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
-        let _ = fs::remove_dir_all(&config_dir);
+        cleanup(&inst);
     }
 
     fn routes() -> Vec<Ipv4Net> {
@@ -859,9 +1004,66 @@ mod tests {
             .expect_err("незакрытый inline-блок обязан быть отказом, не догадкой");
         assert!(matches!(err, WinNetError::Profile(_)));
         assert!(
-            !inst.config_dir.join("proxypilot-office.ovpn").exists(),
+            !inst.user_config_dir.join("proxypilot-office.ovpn").exists(),
             "ничего не должно записываться при отказе сборки"
         );
         cleanup(&inst);
+    }
+
+    // ---- Fix: install_profile писал в системный каталог (Program Files),
+    // недоступный на запись обычному пользователю. Профиль кладётся в
+    // user_config_dir; find_config_file читает исходный .ovpn из обоих
+    // мест, предпочитая явно пользовательское расположение.
+
+    #[test]
+    fn find_config_file_prefers_the_user_directory_when_present_in_both() {
+        let inst = installation_with_stub_gui("find-both");
+        fs::create_dir_all(&inst.config_dir).unwrap();
+        fs::create_dir_all(&inst.user_config_dir).unwrap();
+        fs::write(inst.config_dir.join("source.ovpn"), "системная версия\n").unwrap();
+        fs::write(
+            inst.user_config_dir.join("source.ovpn"),
+            "пользовательская версия\n",
+        )
+        .unwrap();
+
+        let found = find_config_file(&inst, "source.ovpn").expect("файл есть в обоих местах");
+        assert_eq!(found, inst.user_config_dir.join("source.ovpn"));
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn find_config_file_falls_back_to_the_system_directory() {
+        let inst = installation_with_stub_gui("find-system-only");
+        fs::create_dir_all(&inst.config_dir).unwrap();
+        fs::write(inst.config_dir.join("source.ovpn"), "системная версия\n").unwrap();
+
+        let found = find_config_file(&inst, "source.ovpn").expect("файл есть в системном каталоге");
+        assert_eq!(found, inst.config_dir.join("source.ovpn"));
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn find_config_file_returns_none_when_absent_from_both() {
+        let inst = installation_with_stub_gui("find-neither");
+        assert!(find_config_file(&inst, "source.ovpn").is_none());
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn resolve_user_config_dir_fails_clearly_when_userprofile_is_unset() {
+        let err = resolve_user_config_dir(None)
+            .expect_err("отсутствие %USERPROFILE% обязано быть явным отказом");
+        assert!(matches!(err, WinNetError::UserProfileNotFound));
+    }
+
+    #[test]
+    fn resolve_user_config_dir_joins_openvpn_config_onto_the_profile() {
+        // Не настоящий домашний каталог — придуманный путь ради теста
+        // (CLAUDE.md, «Данные»).
+        let profile = PathBuf::from(r"C:\Users\ExampleUser");
+        let got = resolve_user_config_dir(Some(profile.clone()))
+            .expect("заданный профиль обязан резолвиться");
+        assert_eq!(got, profile.join("OpenVPN").join("config"));
     }
 }

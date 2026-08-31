@@ -67,4 +67,15 @@ pub enum WinNetError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    /// `%USERPROFILE%` не задан в окружении процесса —
+    /// `openvpn::find_installation` не может вычислить каталог, куда
+    /// обычный пользователь действительно способен писать
+    /// (`Installation::user_config_dir`). Молча подставлять вместо него
+    /// системный каталог нельзя: он под `Program Files` и на запись
+    /// обычному пользователю недоступен (докблок `Installation`) — такая
+    /// подмена превратила бы честный отказ здесь в невнятный
+    /// `ProfileWrite` с access denied чуть позже, при первой попытке
+    /// записи.
+    #[error("не удалось определить %USERPROFILE% — переменная окружения не задана")]
+    UserProfileNotFound,
 }
