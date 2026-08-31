@@ -15,7 +15,8 @@
 //! Проверяется именно файл, а не факт существования записи в реестре:
 //! деинсталлятор оставляет ключ на месте, и `Installation`, указывающий на
 //! несуществующий exe, обернулся бы невнятной ошибкой при первой попытке
-//! подключения (Task 4) вместо честного «не установлен» здесь и сейчас.
+//! подключения (`connect`/`disconnect` ниже) вместо честного «не установлен»
+//! здесь и сейчас.
 //!
 //! Реестр читается через `sysproxy::RegKey` — ту же обёртку, что и
 //! `sysproxy`/`autostart`, только с другим корнем (`HKEY_LOCAL_MACHINE`
@@ -36,13 +37,15 @@
 //! попытки.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use proxypilot_core::net::Ipv4Net;
 use windows::core::{w, HRESULT, PCWSTR};
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, KEY_READ};
 
 use crate::sysproxy::RegKey;
-use crate::WinNetError;
+use crate::{ovpn_profile, WinNetError};
 
 const SUBKEY: PCWSTR = w!("SOFTWARE\\OpenVPN");
 const BIN_DIR: PCWSTR = w!("bin_dir");
@@ -53,8 +56,10 @@ const CONFIG_DIR: PCWSTR = w!("config_dir");
 /// `locate` и возможной будущей правкой.
 const GUI_EXE_NAME: &str = "openvpn-gui.exe";
 
-/// Найденная установка OpenVPN: путь к GUI-исполняемому файлу (им управляет
-/// Task 4) и к каталогу, где лежат пользовательские `.ovpn`-конфигурации.
+/// Найденная установка OpenVPN: путь к GUI-исполняемому файлу (им управляют
+/// `connect`/`disconnect`/`status` ниже) и к каталогу, где лежат
+/// пользовательские `.ovpn`-конфигурации (в него же `install_profile` кладёт
+/// наш собственный профиль).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub gui_exe: PathBuf,
@@ -143,8 +148,8 @@ fn standard_config_dir(program_files: &Path) -> PathBuf {
 /// оставленный деинсталлятором, или стандартный путь без установки не
 /// должны выглядеть как рабочая установка. Для `config_dir` та же проверка
 /// не нужна: отсутствующий каталог конфигураций — это просто «конфигураций
-/// пока нет», а не «OpenVPN не установлен», и его находит Task 4 при
-/// перечислении `.ovpn`-файлов.
+/// пока нет», а не «OpenVPN не установлен»; `install_profile` ниже создаёт
+/// его сама при необходимости.
 fn locate(
     bin_dir_value: &str,
     config_dir_value: &str,
@@ -168,6 +173,155 @@ fn locate(
     Some(Installation {
         gui_exe,
         config_dir,
+    })
+}
+
+/// Расширение файла профиля в каталоге конфигураций OpenVPN —
+/// `openvpn-gui.exe` подбирает конфигурации именно по `*.ovpn` в этом
+/// каталоге.
+const PROFILE_EXTENSION: &str = "ovpn";
+
+/// Известно ли ещё, что `Installation` указывает на настоящую установку
+/// OpenVPN. `find_installation` проверяет `gui_exe.is_file()` один раз в
+/// момент поиска; между тем моментом и вызовом любой из функций ниже
+/// OpenVPN мог быть удалён — проверяем заново, а не доверяем однажды
+/// найденному пути молча. Общая точка для всех четырёх функций задачи 4:
+/// расходиться в этой проверке означало бы, что одни отказывают честно,
+/// а другие — тихой попыткой записи в путь, которого больше нет.
+fn ensure_still_installed(inst: &Installation) -> Result<(), WinNetError> {
+    if !inst.gui_exe.is_file() {
+        return Err(WinNetError::OpenVpnNotFound {
+            gui_exe: inst.gui_exe.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Путь к нашему профилю в каталоге конфигураций OpenVPN. `name` — то же
+/// самое значение, что уходит в `--command connect|disconnect <name>`
+/// (`build_gui_command`, спека 8.3): один параметр на оба места, а не два
+/// независимых имени (файла и команды), которые могли бы разойтись.
+fn profile_path(inst: &Installation, name: &str) -> PathBuf {
+    inst.config_dir.join(format!("{name}.{PROFILE_EXTENSION}"))
+}
+
+/// Кладёт готовый текст профиля под собственным именем `name` в каталог
+/// конфигураций OpenVPN. Существующие профили пользователя не читаются,
+/// не перемещаются, не переименовываются и не удаляются — пишется ровно
+/// один файл `<name>.ovpn`, остальное содержимое каталога вообще не
+/// просматривается.
+///
+/// Каталог конфигураций создаётся, если его ещё нет: отсутствие каталога
+/// само по себе не признак «OpenVPN не установлен» (см. докблок `locate`
+/// выше — «конфигураций пока нет» это законное состояние), а
+/// `install_profile` вполне может оказаться первым, что кладёт в него
+/// хоть что-то.
+pub fn install_profile(
+    inst: &Installation,
+    name: &str,
+    contents: &str,
+) -> Result<PathBuf, WinNetError> {
+    ensure_still_installed(inst)?;
+    std::fs::create_dir_all(&inst.config_dir).map_err(|source| WinNetError::ProfileWrite {
+        path: inst.config_dir.clone(),
+        source,
+    })?;
+    let path = profile_path(inst, name);
+    std::fs::write(&path, contents).map_err(|source| WinNetError::ProfileWrite {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// Собирает профиль (`ovpn_profile::build_profile`) и кладёт его под
+/// `name` тем же путём, что и `install_profile`. Единственное место в
+/// этом крейте, вызывающее `build_profile`: задача 2 сознательно сделала
+/// её отказывающейся на структурно битом источнике (незакрытый
+/// inline-блок) вместо того, чтобы гадать — здесь этот `Err` доходит до
+/// вызывающего кода как есть, через `?`, и ничего не пишется на диск,
+/// если сборка не удалась.
+pub fn build_and_install_profile(
+    inst: &Installation,
+    name: &str,
+    source: &str,
+    routes: &[Ipv4Net],
+) -> Result<PathBuf, WinNetError> {
+    let contents = ovpn_profile::build_profile(source, routes)?;
+    install_profile(inst, name, &contents)
+}
+
+/// Строит `Command` для `openvpn-gui.exe --command <verb> <name>`, не
+/// запуская его. Чистая функция ради теста: конструирование командной
+/// строки проверяется без побочных эффектов, отдельно от решения,
+/// запускать процесс или нет.
+fn build_gui_command(inst: &Installation, verb: &str, name: &str) -> Command {
+    let mut cmd = Command::new(&inst.gui_exe);
+    cmd.arg("--command").arg(verb).arg(name);
+    cmd
+}
+
+/// Запускает `openvpn-gui.exe --command <verb> <name>` и не ждёт
+/// завершения процесса (`spawn`, а не `status`/`output`): при уже
+/// запущенном GUI это почти мгновенный обмен через именованный канал с
+/// интерактивной службой, а если GUI ещё не запущен — сам процесс
+/// становится долгоживущим окном в трее, и дождаться его завершения
+/// значило бы заблокироваться на неопределённое время, вплоть до выхода
+/// пользователя из OpenVPN GUI.
+fn run_gui_command(inst: &Installation, verb: &str, name: &str) -> Result<(), WinNetError> {
+    ensure_still_installed(inst)?;
+    build_gui_command(inst, verb, name)
+        .spawn()
+        .map_err(|source| WinNetError::OpenVpnGuiLaunch {
+            exe: inst.gui_exe.clone(),
+            source,
+        })?;
+    Ok(())
+}
+
+/// Поднимает наш туннель: `openvpn-gui.exe --command connect <name>`.
+/// Строго через GUI, не `openvpn.exe` напрямую — запуск в обход
+/// интерактивной службы не добавляет маршруты (докблок модуля,
+/// `docs/design.md` §2.4/8.3).
+pub fn connect(inst: &Installation, name: &str) -> Result<(), WinNetError> {
+    run_gui_command(inst, "connect", name)
+}
+
+/// Опускает наш туннель: `openvpn-gui.exe --command disconnect <name>`.
+pub fn disconnect(inst: &Installation, name: &str) -> Result<(), WinNetError> {
+    run_gui_command(inst, "disconnect", name)
+}
+
+/// Что этот вызов знает о профиле `name`, не запуская ничего и не читая
+/// таблицу маршрутов.
+///
+/// Умышленно не различает «поднят»/«опущен»: у `openvpn-gui.exe` нет
+/// синхронного текстового запроса состояния — только `connect` и
+/// `disconnect` (докблок модуля, `docs/design.md` §8.3). Единственный
+/// источник живого состояния — таблица маршрутов через
+/// `tunnel_state::our_tunnel_up`, а она сама честно предупреждает: имя
+/// интерфейса Windows не устойчивый идентификатор, пользователь может
+/// переименовать адаптер, и разные API показывают его alias по-разному
+/// (докблок `tunnel_state`). Смешивать факт «файл профиля лежит на диске»
+/// с предположением о том, поднят ли туннель прямо сейчас, значило бы
+/// выдавать одно за другое — этот тип различает только первое.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelStatus {
+    /// Файла `<name>.ovpn` в каталоге конфигураций нет — профиль ещё не
+    /// установлен (или пользователь его удалил).
+    NotInstalled,
+    /// Файл профиля есть на диске. Поднято ли сейчас само подключение —
+    /// эта функция не знает, см. докблок [`TunnelStatus`].
+    Installed,
+}
+
+/// Установлен ли профиль `name` на диске каталога конфигураций OpenVPN.
+pub fn status(inst: &Installation, name: &str) -> Result<TunnelStatus, WinNetError> {
+    ensure_still_installed(inst)?;
+    Ok(if profile_path(inst, name).is_file() {
+        TunnelStatus::Installed
+    } else {
+        TunnelStatus::NotInstalled
     })
 }
 
@@ -389,5 +543,239 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("временный каталог теста обязан создаваться");
         dir
+    }
+
+    // ---- Задача 4: install_profile / connect / disconnect / status ----
+    //
+    // Ни один из этих тестов не запускает openvpn-gui.exe и не поднимает
+    // туннель — контроллер сессии прямо запрещает живой прогон на этой
+    // машине (CLAUDE.md, «Живые проверки, которые не делает агент»).
+    // `connect`/`disconnect` проверяются на уровне построения команды
+    // (`build_gui_command` — чистая функция, ничего не запускает) и на
+    // отказе при несуществующем `gui_exe`: `ensure_still_installed`
+    // обрывает выполнение раньше, чем дошло бы до `Command::spawn`.
+
+    use proxypilot_core::net::Ipv4Net;
+    use std::str::FromStr;
+
+    /// `Installation`, чей `gui_exe` заведомо не существует на диске —
+    /// для проверки отказа «OpenVPN не найден».
+    fn fake_installation_with_missing_gui(config_dir: PathBuf) -> Installation {
+        Installation {
+            gui_exe: config_dir.join("definitely-does-not-exist-openvpn-gui.exe"),
+            config_dir,
+        }
+    }
+
+    /// `Installation` с настоящим (хоть и пустым) файлом на месте
+    /// `gui_exe`, чтобы `ensure_still_installed` пропускала её дальше —
+    /// сам файл никогда не запускается.
+    fn installation_with_stub_gui(name: &str) -> Installation {
+        let bin_dir = unique_temp_dir(&format!("{name}-bin"));
+        fs::write(bin_dir.join(GUI_EXE_NAME), b"stub").unwrap();
+        let config_dir = unique_temp_dir(&format!("{name}-config"));
+        Installation {
+            gui_exe: bin_dir.join(GUI_EXE_NAME),
+            config_dir,
+        }
+    }
+
+    fn cleanup(inst: &Installation) {
+        let _ = fs::remove_dir_all(&inst.config_dir);
+        if let Some(bin_dir) = inst.gui_exe.parent() {
+            let _ = fs::remove_dir_all(bin_dir);
+        }
+    }
+
+    #[test]
+    fn build_gui_command_for_connect_targets_our_profile_by_name() {
+        let inst = installation_with_stub_gui("cmd-connect");
+        let cmd = build_gui_command(&inst, "connect", "proxypilot-office");
+        assert_eq!(cmd.get_program(), inst.gui_exe.as_os_str());
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, ["--command", "connect", "proxypilot-office"]);
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn build_gui_command_for_disconnect_targets_our_profile_by_name() {
+        let inst = installation_with_stub_gui("cmd-disconnect");
+        let cmd = build_gui_command(&inst, "disconnect", "proxypilot-office");
+        assert_eq!(cmd.get_program(), inst.gui_exe.as_os_str());
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, ["--command", "disconnect", "proxypilot-office"]);
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn connect_fails_clearly_when_openvpn_is_not_found() {
+        let config_dir = unique_temp_dir("connect-missing-gui");
+        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let err = connect(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
+        assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
+        let _ = fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn disconnect_fails_clearly_when_openvpn_is_not_found() {
+        let config_dir = unique_temp_dir("disconnect-missing-gui");
+        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let err = disconnect(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
+        assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
+        let _ = fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn install_profile_writes_under_our_own_name() {
+        let inst = installation_with_stub_gui("install-basic");
+        let path = install_profile(&inst, "proxypilot-office", "client\ndev tun\n")
+            .expect("запись профиля обязана удаться");
+        assert_eq!(path, inst.config_dir.join("proxypilot-office.ovpn"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "client\ndev tun\n");
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn install_profile_does_not_touch_neighbouring_files() {
+        let inst = installation_with_stub_gui("install-neighbours");
+        fs::create_dir_all(&inst.config_dir).unwrap();
+        let neighbour = inst.config_dir.join("my-existing-work-profile.ovpn");
+        fs::write(&neighbour, "исходный пользовательский профиль\n").unwrap();
+
+        install_profile(&inst, "proxypilot-office", "наш профиль\n")
+            .expect("запись профиля обязана удаться");
+
+        assert_eq!(
+            fs::read_to_string(&neighbour).unwrap(),
+            "исходный пользовательский профиль\n"
+        );
+        let mut names: Vec<_> = fs::read_dir(&inst.config_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "my-existing-work-profile.ovpn".to_string(),
+                "proxypilot-office.ovpn".to_string(),
+            ]
+        );
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn install_profile_round_trips_a_config_dir_with_spaces() {
+        // Обычное место установки — "C:\Program Files\OpenVPN\config":
+        // путь с пробелом в компоненте каталога.
+        let base = unique_temp_dir("install-spaces");
+        let bin_dir = base.join("Program Files").join("OpenVPN").join("bin");
+        let config_dir = base.join("Program Files").join("OpenVPN").join("config");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join(GUI_EXE_NAME), b"stub").unwrap();
+        let inst = Installation {
+            gui_exe: bin_dir.join(GUI_EXE_NAME),
+            config_dir: config_dir.clone(),
+        };
+
+        let path = install_profile(&inst, "proxypilot-office", "содержимое профиля\n")
+            .expect("путь с пробелом обязан работать");
+        assert_eq!(path, config_dir.join("proxypilot-office.ovpn"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "содержимое профиля\n");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn install_profile_creates_the_config_dir_if_it_does_not_exist_yet() {
+        let inst = installation_with_stub_gui("install-create-dir");
+        // config_dir специально удаляем — как и объяснено в докблоке
+        // `locate` выше, "конфигураций пока нет" не значит "не установлен".
+        fs::remove_dir_all(&inst.config_dir).unwrap();
+        assert!(!inst.config_dir.exists());
+
+        let path = install_profile(&inst, "proxypilot-office", "x\n")
+            .expect("каталог конфигураций обязан создаться сам");
+        assert!(path.is_file());
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn install_profile_fails_clearly_when_openvpn_is_not_found() {
+        let config_dir = unique_temp_dir("install-missing-gui");
+        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let err = install_profile(&inst, "proxypilot-office", "x\n")
+            .expect_err("gui_exe отсутствует на диске");
+        assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
+        assert!(
+            !config_dir.join("proxypilot-office.ovpn").exists(),
+            "профиль не должен писаться, если установка не подтверждена"
+        );
+        let _ = fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn status_reports_not_installed_when_the_profile_file_is_absent() {
+        let inst = installation_with_stub_gui("status-absent");
+        let got = status(&inst, "proxypilot-office").expect("статус обязан читаться");
+        assert_eq!(got, TunnelStatus::NotInstalled);
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn status_reports_installed_when_the_profile_file_is_present() {
+        let inst = installation_with_stub_gui("status-present");
+        install_profile(&inst, "proxypilot-office", "x\n").unwrap();
+        let got = status(&inst, "proxypilot-office").expect("статус обязан читаться");
+        assert_eq!(got, TunnelStatus::Installed);
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn status_fails_clearly_when_openvpn_is_not_found() {
+        let config_dir = unique_temp_dir("status-missing-gui");
+        let inst = fake_installation_with_missing_gui(config_dir.clone());
+        let err = status(&inst, "proxypilot-office").expect_err("gui_exe отсутствует на диске");
+        assert!(matches!(err, WinNetError::OpenVpnNotFound { .. }));
+        let _ = fs::remove_dir_all(&config_dir);
+    }
+
+    fn routes() -> Vec<Ipv4Net> {
+        // RFC 5737 — документационный диапазон, не настоящая офисная сеть
+        // (CLAUDE.md).
+        vec![Ipv4Net::from_str("203.0.113.0/24").unwrap()]
+    }
+
+    #[test]
+    fn build_and_install_profile_writes_the_built_profile() {
+        let inst = installation_with_stub_gui("build-install-ok");
+        let source = "client\ndev tun\n";
+
+        let path = build_and_install_profile(&inst, "proxypilot-office", source, &routes())
+            .expect("корректный источник обязан собраться и записаться");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("client"));
+        assert!(written.contains("route 203.0.113.0 255.255.255.0"));
+        cleanup(&inst);
+    }
+
+    #[test]
+    fn build_and_install_profile_propagates_a_profile_error_without_writing_anything() {
+        // Незакрытый inline-блок — build_profile обязана отказаться, а не
+        // выдать правдоподобный, но битый результат (задача 2). Эта
+        // функция — первый вызывающий, и ошибка обязана дойти до
+        // вызывающего кода, а не быть проглоченной.
+        let inst = installation_with_stub_gui("build-install-err");
+        let broken_source = "client\n<ca>\nCERT\n";
+
+        let err = build_and_install_profile(&inst, "proxypilot-office", broken_source, &[])
+            .expect_err("незакрытый inline-блок обязан быть отказом, не догадкой");
+        assert!(matches!(err, WinNetError::Profile(_)));
+        assert!(
+            !inst.config_dir.join("proxypilot-office.ovpn").exists(),
+            "ничего не должно записываться при отказе сборки"
+        );
+        cleanup(&inst);
     }
 }
