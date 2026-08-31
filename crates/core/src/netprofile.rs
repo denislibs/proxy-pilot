@@ -65,6 +65,15 @@ pub struct AdapterConfig {
     /// адрес для лабораторного стенда руками»: `decide_profile` обязана
     /// оставить второе в покое.
     pub set_by_us: bool,
+    /// Текущие DNS-серверы адаптера. Нужны, чтобы `decide_profile` могла
+    /// честно сравнить «уже настроено то, что мы бы поставили» — без этого
+    /// поля сравнение было бы неполным: адрес мог совпасть, а DNS остаться
+    /// старым, и `LeaveAlone` тогда молчал бы поверх настоящего расхождения.
+    /// Ревью fix round 1 (задача 5): поле добавлено, потому что задача 6
+    /// вызывает `decide_profile` на каждое событие смены сети, а NLM может
+    /// стрелять несколько раз на одно физическое изменение — без сравнения
+    /// DNS адаптер получал бы одну и ту же статику заново на каждый выстрел.
+    pub dns: Vec<Ipv4Addr>,
 }
 
 /// Действие, которое нужно применить к адаптеру. Само действие ничего не
@@ -110,7 +119,28 @@ pub fn decide_profile(
 
     if in_office {
         // Дошли сюда — адаптер либо на DHCP, либо несёт нашу же прежнюю
-        // статику. Оба случая безопасно перезаписать офисным профилем.
+        // статику. Оба случая безопасно перезаписать офисным профилем — но
+        // если это уже наша статика и она совпадает с тем, что мы бы
+        // поставили, перезапись — чистый шум: задача 6 вызывает эту функцию
+        // на каждое сетевое событие, а NLM может выстрелить несколько раз
+        // подряд на одно и то же физическое изменение (переподключение
+        // Wi-Fi, DHCP-продление аренды). Реальная запись в `netsh` на живом
+        // адаптере ради результата, который и так уже верен, — цена без
+        // выгоды. Сравниваем адрес и DNS: маску сюда не включаем — этот тип
+        // не хранит текущую маску адаптера (`AdapterConfig` умышленно
+        // расширен ревью только под DNS, не под маску), а адрес и маску мы
+        // всегда ставим вместе одним вызовом `netsh`, так что дрейф маски
+        // при неизменном адресе означал бы вмешательство извне — тот же
+        // случай, что уже покрыт правилом «чужая статика не трогается»
+        // выше, только если бы `set_by_us` при этом осталось true, чего
+        // корректная реализация задачи 6 допускать не должна.
+        let already_correct = !current.dhcp
+            && current.set_by_us
+            && current.addr == Some(ip)
+            && current.dns == profile.office_dns;
+        if already_correct {
+            return ProfileAction::LeaveAlone;
+        }
         ProfileAction::SetStatic {
             ip,
             mask,
@@ -153,11 +183,31 @@ mod tests {
         }
     }
 
+    /// Наша прежняя статика, но с адресом задачи (пока ещё) не пушенным
+    /// DNS — представляет «мы ставили статику раньше, профиль с тех пор
+    /// поменялся». В таблице ниже это по-прежнему должно давать
+    /// `SetStatic`, поэтому DNS здесь намеренно НЕ совпадает с
+    /// `sample_profile().office_dns`; для сценария «уже всё верно» есть
+    /// отдельная фикстура `our_static_matching_profile`.
     fn our_static() -> AdapterConfig {
         AdapterConfig {
             dhcp: false,
             addr: Some(Ipv4Addr::new(203, 0, 113, 10)),
             set_by_us: true,
+            dns: Vec::new(),
+        }
+    }
+
+    /// Наша статика, полностью совпадающая с тем, что выдал бы
+    /// `sample_profile()` — и адрес, и DNS. `decide_profile` обязана
+    /// вернуть `LeaveAlone`, а не переписывать адаптер тем же самым
+    /// значением при каждом повторном вызове (задача 6 вызывает решение
+    /// на каждое сетевое событие, а NLM может выстрелить несколько раз
+    /// подряд на одно и то же физическое изменение).
+    fn our_static_matching_profile() -> AdapterConfig {
+        AdapterConfig {
+            dns: sample_profile().office_dns,
+            ..our_static()
         }
     }
 
@@ -166,6 +216,7 @@ mod tests {
             dhcp: false,
             addr: Some(Ipv4Addr::new(198, 51, 100, 20)),
             set_by_us: false,
+            dns: Vec::new(),
         }
     }
 
@@ -174,6 +225,7 @@ mod tests {
             dhcp: true,
             addr: None,
             set_by_us: false,
+            dns: Vec::new(),
         }
     }
 
@@ -267,6 +319,54 @@ mod tests {
         assert_eq!(
             decide_profile(true, &profile, &on_dhcp()),
             ProfileAction::LeaveAlone
+        );
+    }
+
+    #[test]
+    fn a_static_that_already_matches_the_profile_is_left_alone() {
+        // Ревью fix round 1: избегаем шума на живом адаптере, когда решение
+        // запрашивают повторно (несколько событий NLM на одну смену сети),
+        // а применять уже нечего.
+        assert_eq!(
+            decide_profile(true, &sample_profile(), &our_static_matching_profile()),
+            ProfileAction::LeaveAlone
+        );
+    }
+
+    #[test]
+    fn matching_address_but_wrong_dns_is_still_reapplied() {
+        // Если бы сравнение смотрело только на адрес, этот случай тоже дал
+        // бы `LeaveAlone` — и устаревший DNS остался бы навсегда.
+        let mut current = our_static_matching_profile();
+        current.dns = vec![Ipv4Addr::new(198, 51, 100, 53)];
+        assert_eq!(
+            decide_profile(true, &sample_profile(), &current),
+            ProfileAction::SetStatic {
+                ip: Ipv4Addr::new(203, 0, 113, 10),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+                gateway: Some(Ipv4Addr::new(203, 0, 113, 1)),
+                dns: sample_profile().office_dns,
+            }
+        );
+    }
+
+    #[test]
+    fn matching_dns_but_wrong_address_is_still_reapplied() {
+        let mut current = our_static_matching_profile();
+        current.addr = Some(Ipv4Addr::new(203, 0, 113, 11));
+        assert_eq!(
+            decide_profile(true, &sample_profile(), &current),
+            expected_static()
+        );
+    }
+
+    #[test]
+    fn a_static_that_already_matches_is_still_reset_outside_the_office() {
+        // Совпадение с профилем не защищает от возврата в DHCP вне офиса —
+        // «уже верно» имеет смысл только внутри правила «мы в офисе».
+        assert_eq!(
+            decide_profile(false, &sample_profile(), &our_static_matching_profile()),
+            ProfileAction::SetDhcp
         );
     }
 }

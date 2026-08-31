@@ -721,3 +721,151 @@ error: could not compile `proxypilot-app` (bin "proxypilot" test) due to 1 previ
 - Задача 7 (страница настроек) — понадобится редактор `office_subnets`,
   `net_profile` и переключатель `automate_tunnel`; поля названы так, чтобы
   быть понятными в UI без дополнительного перевода.
+- `Config::validate` не проверяет `net_profile`: ни что `office_mask` —
+  связная маска, ни что `office_ip` лежит внутри неё. Осознанно вне брифа
+  этой задачи (контроллер подтвердил находку 4 fix round 1 как «genuinely
+  outside your brief's scope») — ложится на задачу 6 (там же появится
+  первый реальный потребитель `office_mask`, применяющий её через `netsh`)
+  или на задачу 7 (форма настроек — первое место, где невалидное значение
+  введёт человек).
+
+## Fix round 1 (approved with fixes, commit поверх `501f928`)
+
+Ревью: без Critical, без Important, четыре Minor. Всё закрыто одним
+коммитом поверх `501f928`.
+
+1. **Minor — нормализация при загрузке была реальной, но непроверенной.**
+   Все три прежних serde-теста `Ipv4Net` (`net.rs`) брали уже
+   нормализованные строки, поэтому ни один не поймал бы регресс, если бы
+   маскировка хостовых битов сломалась именно на пути `Deserialize`.
+   Добавлен `serde_masks_host_bits_on_load_same_as_from_str`: строка с
+   хостовыми битами (`"203.0.113.5/24"`) читается как `"203.0.113.0/24"`,
+   и в этой же форме уходит обратно при повторной сериализации.
+
+2. **Minor, разобранный подробно — `AdapterConfig.addr` не участвовал в
+   решении.** `decide_profile` отличала «чужое» исключительно по
+   `!dhcp && !set_by_us`, а поле `addr` было чистым проходным значением —
+   риск в том, что автор задачи 6 прочитал бы его как участвующее в
+   решении, хотя это не так.
+
+   Сделано полем решения, а не задокументировано как декоративное — у
+   этого есть настоящее применение: задача 6 вызывает `decide_profile` на
+   каждое сетевое событие, а NLM может выстрелить несколько раз на одно
+   физическое изменение (переподключение Wi-Fi, продление аренды DHCP).
+   Без сравнения с уже настроенным значением адаптер получал бы одну и ту
+   же статику заново на каждый выстрел — запись в `netsh`, дающая
+   тот же результат, что уже есть.
+
+   Правило: `decide_profile` возвращает `LeaveAlone`, когда мы в офисе,
+   статика наша, и текущие `addr`+`dns` уже совпадают с тем, что профиль
+   бы поставил. Чтобы сравнение было честным, `AdapterConfig` получил
+   поле `dns: Vec<Ipv4Addr>` — без него `LeaveAlone` мог бы уйти поверх
+   устаревшего DNS, о чём ревью предупредило прямо текстом.
+
+   Осознанная граница, доведённая до конца, а не обойдённая: сравнение не
+   включает маску, потому что `AdapterConfig` не хранит текущую маску
+   адаптера вовсе — бриф ревью расширял тип явно только под DNS.
+   Рассуждение, почему это не подрывает честность сравнения: адрес и
+   маску всегда ставит один и тот же вызов `netsh` (внутри задачи 6), то
+   есть их дрейф друг без друга при `set_by_us == true` означал бы
+   вмешательство извне поверх нашей же записи — а это уже покрыто
+   отдельным, более общим правилом «чужая статика не трогается» чуть
+   выше; корректная задача 6 не должна оставлять `set_by_us == true` на
+   адресе, который поменяли не мы. Довод не идеальный (проверить его
+   нечем, пока задача 6 не написана), поэтому граница явно названа в
+   комментарии кода и здесь, а не спрятана.
+
+   Тесты: `a_static_that_already_matches_the_profile_is_left_alone`,
+   `matching_address_but_wrong_dns_is_still_reapplied`,
+   `matching_dns_but_wrong_address_is_still_reapplied`,
+   `a_static_that_already_matches_is_still_reset_outside_the_office`
+   (совпадение с профилем не освобождает от сброса в DHCP вне офиса —
+   «уже верно» имеет смысл только внутри правила «мы в офисе»). Фикстура
+   `our_static()` намеренно оставлена с несовпадающим DNS (представляет
+   «мы ставили статику раньше, профиль с тех пор поменялся») — иначе
+   старый табличный тест `decision_table_covers_every_combination` начал
+   бы молчать о регрессии в новой ветке `already_correct`, а не проверять
+   её отдельно; для сценария «всё уже верно» заведена отдельная фикстура
+   `our_static_matching_profile()`.
+
+3. **Minor — разводящий комментарий указывал только в одну сторону.**
+   `office_subnets` называл `office_networks` в своём докблоке, но не
+   наоборот. `config.rs`: у `office_networks` теперь свой докблок с тем же
+   разводящим предложением, читаемым с любой стороны.
+
+4. **Minor, вне брифа — зафиксировано, не реализовано.** См. «Открытые
+   пункты для следующих задач» выше.
+
+### Три команды CI после исправлений — полный вывод
+
+`cargo test --all`, по крейтам:
+
+```
+     Running unittests src\main.rs (target\debug\deps\proxypilot-cbf9a0a06eececc8.exe)
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_bridge-620b032c4470b356.exe)
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+     Running unittests src\main.rs (target\debug\deps\proxypilot_bridge-67e9de3f4fdbb341.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\cli.rs
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_core-e8c89a5d89aa7499.exe)
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_winnet-b4606ab8698a901a.exe)
+test result: ok. 135 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+   Doc-tests proxypilot_bridge
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests proxypilot_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests proxypilot_winnet
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Итого: **396 passed, 0 failed, 3 ignored** (было 391 + 3 ignored; +5 —
+находка 1 добавила 1 тест в `net.rs`, находка 2 добавила 4 теста в
+`netprofile.rs`; находки 3 и 4 тестов не добавляли). Ни один из прежних
+391 не менялся и не удалялся.
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```
+    Checking proxypilot-core v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\core)
+    Checking proxypilot-bridge v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\bridge)
+    Checking proxypilot-winnet v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\winnet)
+    Checking proxypilot-app v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.34s
+```
+
+Чисто.
+
+`cargo fmt --all --check` — первый прогон нашёл два расхождения (перенос
+строк в новом тесте `net.rs` и в новом выражении `already_correct` в
+`netprofile.rs`), поправлено `cargo fmt --all`. Повторный `--check` — без
+вывода, exit code 0.
+
+### Границы задачи — проверено заново после правок
+
+- `grep -rn "#\[allow" crates/core/src/netprofile.rs crates/core/src/config.rs
+  crates/core/src/net.rs` — пусто.
+- `grep -n "unsafe" crates/core/src/netprofile.rs crates/core/src/net.rs
+  crates/core/src/config.rs` — пусто, ни одного `unsafe`-блока не
+  появилось.
+- `cat crates/core/Cargo.toml` — зависимости `proxypilot-core` не
+  менялись: `serde`, `toml`, `thiserror`, `directories`.
+- `netprofile.rs` по-прежнему не содержит ни одного вызова `std::fs`,
+  `std::process`, сетевых сокетов, `std::time` — новое поле `dns` того же
+  платформенно-нейтрального типа `Vec<Ipv4Addr>`, что и остальные данные
+  модуля.
+- Ни `netsh`, ни реестр, ни установка службы — не выполнялись на этой
+  машине ни разу в этом раунде.
+- Тестовые значения этого раунда — снова только RFC 5737
+  (`203.0.113.0/24`, `198.51.100.0/24`); ничего реального в диффе или в
+  этом отчёте.
