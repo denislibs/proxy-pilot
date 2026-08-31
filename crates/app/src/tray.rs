@@ -131,11 +131,28 @@ fn situation_text(state: &AppState) -> String {
     if state.demoted {
         return format!("{} недоступен → работаем напрямую", mode_name(state.mode));
     }
+    // «Напрямую, потому что мы дома» и «напрямую, потому что настраивать было
+    // нечего» — состояния разные: первое верное, второе требует действия. А
+    // выглядели они одинаково, и человек читал «напрямую» как «работает».
+    // Различаем только в «Авто»: закреплённый Direct — это осознанный выбор
+    // ходить мимо прокси, и предупреждать там не о чем.
+    if state.mode == Mode::Auto && no_upstream_configured(state) {
+        return "апстрим не задан → настройте".to_string();
+    }
     match &state.route {
         Route::Socks(addr) => format!("SOCKS5 → {addr}"),
         Route::Http(addr) => format!("HTTP → {addr}"),
         Route::Direct => "напрямую".to_string(),
     }
+}
+
+/// Ни один апстрим не настроен.
+///
+/// `Reachability::Unknown` у проверки живости означает именно «адрес не задан»
+/// (см. `mode_label`), а не «не смогли проверить», поэтому оба `Unknown` —
+/// это надёжный признак пустой настройки, а не сетевого отказа.
+fn no_upstream_configured(state: &AppState) -> bool {
+    state.health.socks == Reachability::Unknown && state.health.http == Reachability::Unknown
 }
 
 /// Строка про сеть, по которой принято решение.
@@ -656,6 +673,30 @@ mod tests {
     fn header_names_the_bridge_and_the_route() {
         let h = header_text(&state(Route::Direct, false));
         assert!(h.contains("127.0.0.1:3129"), "получили: {h}");
+    }
+
+    #[test]
+    fn header_says_so_when_nothing_is_configured() {
+        // Стоило рабочего дня: «Авто» без апстримов честно ходит напрямую,
+        // но заголовок писал «напрямую», и это читается как «работает».
+        let mut s = state(Route::Direct, false);
+        s.mode = Mode::Auto;
+        s.health.socks = Reachability::Unknown;
+        s.health.http = Reachability::Unknown;
+        let h = header_text(&s);
+        assert!(h.contains("апстрим не задан"), "получили: {h}");
+    }
+
+    #[test]
+    fn a_pinned_direct_mode_is_not_a_misconfiguration() {
+        // Закреплённый Direct без апстримов — осознанный выбор, не недосмотр.
+        let mut s = state(Route::Direct, false);
+        s.mode = Mode::Direct;
+        s.health.socks = Reachability::Unknown;
+        s.health.http = Reachability::Unknown;
+        let h = header_text(&s);
+        assert!(!h.contains("не задан"), "получили: {h}");
+        assert!(h.contains("напрямую"), "получили: {h}");
     }
 
     #[test]
