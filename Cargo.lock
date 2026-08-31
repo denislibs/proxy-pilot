@@ -915,6 +915,7 @@ dependencies = [
  "arc-swap",
  "proxypilot-bridge",
  "proxypilot-core",
+ "proxypilot-netsvc",
  "proxypilot-winnet",
  "thiserror 2.0.20",
  "tokio",
@@ -944,6 +945,23 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "toml",
+]
+
+[[package]]
+name = "proxypilot-netsvc"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "proxypilot-core",
+ "proxypilot-winnet",
+ "serde",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

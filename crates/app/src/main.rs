@@ -164,9 +164,84 @@ enum Exit {
 }
 
 fn main() {
+    // `install-service`/`uninstall-service` — единственный запрос прав
+    // администратора во всём продукте (`CLAUDE.md`, «Права
+    // администратора»): регистрация службы `ProxyPilotNetProfile`,
+    // которая одна умеет менять IPv4-адрес. Явные, однократные,
+    // необязательные — кто их не вызвал, не увидит ни одного UAC.
+    // Разбираются раньше `run()`: это не запуск трея, а обычная короткая
+    // команда, которая обязана вернуть управление сразу же.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("install-service") => std::process::exit(run_install_service()),
+        Some("uninstall-service") => std::process::exit(run_uninstall_service()),
+        _ => {}
+    }
+
     if let Err(e) = run() {
         report_failure(&e);
         std::process::exit(1);
+    }
+}
+
+/// Путь к бинарнику самой службы — отдельный исполняемый файл
+/// (`proxypilot-netsvc.exe`), а не этот процесс: ядро (этот `.exe`)
+/// обязано остаться без единого запроса UAC, поэтому статика живёт в
+/// отдельной программе (`crates/netsvc`). Ставится рядом, в том же
+/// каталоге, куда установлен `proxypilot.exe` — оба поставляются вместе
+/// одним инсталлятором (`docs/design.md` §12).
+fn netsvc_exe_path() -> Result<std::path::PathBuf, String> {
+    let self_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = self_exe
+        .parent()
+        .ok_or("у пути к proxypilot.exe нет каталога")?;
+    Ok(dir.join("proxypilot-netsvc.exe"))
+}
+
+/// Возвращает код возврата процесса — 0 при успехе, 1 при отказе, с текстом
+/// отказа в stderr. Не паникует и не показывает `ui::error_box`: это
+/// команда для консоли (человек, поставивший её вручную, с правами
+/// администратора), а не для двойного щелчка по иконке.
+fn run_install_service() -> i32 {
+    match netsvc_exe_path()
+        .and_then(|p| proxypilot_netsvc::install::install(&p).map_err(|e| e.to_string()))
+    {
+        Ok(()) => {
+            println!(
+                "Служба {} зарегистрирована (автозапуск). Она ещё не запущена — \
+                 первый пуск сделает Windows при следующей перезагрузке, или \
+                 запустите её вручную: services.msc / Start-Service {}.",
+                proxypilot_netsvc::SERVICE_NAME,
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "Не удалось установить службу {}: {e}",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            1
+        }
+    }
+}
+
+fn run_uninstall_service() -> i32 {
+    match proxypilot_netsvc::install::uninstall() {
+        Ok(()) => {
+            println!(
+                "Служба {} снята с регистрации.",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "Не удалось удалить службу {}: {e}",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            1
+        }
     }
 }
 
