@@ -21,6 +21,10 @@ pub fn status(inst: &Installation, name: &str) -> Result<TunnelStatus, WinNetErr
 pub enum TunnelStatus { NotInstalled, Installed }
 ```
 
+(Переименовано в fix round 1 ниже: `TunnelStatus` → `ProfileStatus`,
+`status` → `profile_status` — само название вводило в заблуждение сильнее,
+чем помогал докблок.)
+
 `crates/winnet/src/lib.rs` — четыре новых варианта `WinNetError`:
 `OpenVpnNotFound`, `OpenVpnGuiLaunch`, `ProfileWrite`, `Profile` (последний
 — `#[from] ovpn_profile::ProfileError`).
@@ -442,3 +446,137 @@ connect|disconnect` на этой же машине (CLAUDE.md, «Живые п�
   `TunnelStatus`, 14 новых тестов. Три doc-комментария, ссылавшиеся на
   «Task 4» как на будущее, поправлены на конкретные имена.
 - `crates/winnet/src/lib.rs` — четыре новых варианта `WinNetError`.
+
+## Fix round 1 (approved with fixes, commit поверх `e968d52`)
+
+Ревью: без Critical, оба заявленных отступления от брифа приняты по
+существу (изменённое требование к `install_profile`/`build_profile` — не
+моя ошибка, а неисполнимая формулировка брифа; `TunnelStatus` как
+разделение труда с `tunnel_state` — архитектурно верно, но неверно
+названо). Семь находок, ни одной Critical: три Important, три Minor,
+один пункт остаётся на стороне контроллера. Все закрыты одним коммитом
+поверх `e968d52`.
+
+1. **Important — переименование `TunnelStatus` → `ProfileStatus`,
+   `status` → `profile_status`** (`openvpn.rs`). Причина ревью: тип и
+   функция называли себя «туннель», отвечая на вопрос «есть ли файл» —
+   `status(...).is_ok() == Installed` читалось бы как «подключено» тем,
+   кто не открыл докблок. Варианты (`NotInstalled`/`Installed`) не
+   менялись, только имена типа, функции и всех вызовов/тестов. Докблок
+   `ProfileStatus` теперь прямо объясняет, почему имя не «Tunnel»:
+   «Тип, названный «TunnelStatus», рядом с вариантом `Installed` выглядел
+   бы как «туннель поднят» для того, кто читает только сигнатуру, а не
+   докблок, — отсюда `ProfileStatus`».
+2. **Important — докблок `connect`/`disconnect` теперь прямо говорит, что
+   `Ok` означает «команда доставлена GUI», не «туннель поднят».** Раньше
+   первая строка докблока `connect` («Поднимает наш туннель») читалась
+   как обещание результата; сам факт асинхронности был виден только в
+   докблоке `run_gui_command` и в `WinNetError::OpenVpnGuiLaunch` в
+   `lib.rs`, а не в контракте самой публичной функции, на которую будет
+   смотреть задача 7.
+3. **Important — `cleanup` в тестах теперь проверяет `starts_with(std::env::temp_dir())`
+   перед `remove_dir_all`.** Раньше функция удаляла `inst.config_dir` и
+   родителя `inst.gui_exe` без всякой проверки — безопасно только потому,
+   что все текущие вызовы передают временную фикстуру. Один copy-paste на
+   настоящий `Installation` (например, при отладке живого сценария) снёс
+   бы каталог `bin` установленного на машине OpenVPN. Теперь при выходе
+   пути за `%TEMP%` `cleanup` — не ошибка, а тихий no-op, что для тестовой
+   уборки безопаснее, чем падение.
+4. **Minor — докблок `install_profile` теперь называет
+   `build_and_install_profile` рекомендуемой точкой входа** и объясняет,
+   что `install_profile` не проверяет происхождение `contents`: вызывающий
+   код, собравший текст профиля в обход `ovpn_profile::build_profile`
+   (например, конкатенацией строк), откроет второй путь мимо отказа на
+   структурно битом источнике, и `install_profile` этого не поймает.
+5. **Minor — добавлен тест `build_gui_command_survives_a_program_path_with_spaces`**:
+   строит `Installation` с `gui_exe` под `...\Program Files\OpenVPN\bin\
+   openvpn-gui.exe` (пробел в компоненте пути — обычное место установки)
+   и проверяет, что `build_gui_command` передаёт путь и аргументы
+   раздельно, не конкатенацией строк, где пробел развалил бы разбор.
+6. **Minor — добавлен тест `install_profile_overwrites_an_existing_file_under_our_own_name`**:
+   две последовательные записи под одним именем, вторая обязана заменить
+   содержимое первой. Задача 5 перестраивает и перезаписывает профиль при
+   каждой смене списка офисных подсетей — перезапись обычный ход дел,
+   не редкий край.
+7. **Minor, на стороне контроллера — ничего не менялось в этой задаче.**
+   Ничто пока не определяет **наш** псевдоним интерфейса (`our_alias` в
+   терминах `tunnel_state::our_tunnel_up`/`foreign_tunnel_up`, задача 3):
+   этот параметр появится только вместе с тем, что реально поднимает
+   адаптер (профиль OpenVPN, задача 5-7), и до того момента
+   `our_tunnel_up`/`foreign_tunnel_up` физически нечем вызвать с верным
+   значением. Контроллер зафиксировал это как открытый пункт для брифа
+   задачи 7, не для этой задачи.
+
+### Переименование по крейту — проверено
+
+`grep -rn "TunnelStatus\b" crates/` до правки находил использования
+только в `openvpn.rs`/`lib.rs` — переименование не задело код за
+пределами этой задачи (задачи 5-7 ещё не написаны и на `TunnelStatus`
+не ссылались).
+
+### Три команды CI после исправлений — полный вывод
+
+`cargo test --all`, по крейтам:
+
+```
+     Running unittests src\main.rs (target\debug\deps\proxypilot-cbf9a0a06eececc8.exe)
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.58s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_bridge-620b032c4470b356.exe)
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+     Running unittests src\main.rs (target\debug\deps\proxypilot_bridge-67e9de3f4fdbb341.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\cli.rs (target\debug\deps\cli-f96b6e93f92cfebe.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_core-e8c89a5d89aa7499.exe)
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\proxypilot_winnet-b4606ab8698a901a.exe)
+test result: ok. 135 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+   Doc-tests proxypilot_bridge
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests proxypilot_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests proxypilot_winnet
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Итого: **379 passed, 0 failed, 3 ignored** (было 377 + 3 ignored; +2 —
+находки 5 и 6 добавили по одному тесту каждая, находки 1-4 и 7 тестов не
+добавляли). Целевой фильтр `cargo test -p proxypilot-winnet --lib openvpn`
+даёт 25 тестов (было 23; +2), все зелёные, включая переименованные
+`profile_status_reports_not_installed_when_the_profile_file_is_absent`,
+`profile_status_reports_installed_when_the_profile_file_is_present`,
+`profile_status_fails_clearly_when_openvpn_is_not_found`.
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```
+    Checking proxypilot-winnet v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\winnet)
+    Checking proxypilot-app v0.1.0 (C:\Users\User\Desktop\proxypilot\proxy-pilot-win\crates\app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.85s
+```
+
+Чисто.
+
+`cargo fmt --all --check` — без вывода, exit code 0.
+
+### Границы задачи — проверено заново после правок
+
+- `grep -n "#\[allow" crates/winnet/src/openvpn.rs crates/winnet/src/lib.rs`
+  — по-прежнему пусто.
+- `grep -n "\.spawn()\|Command::new\|\.status()\|\.output()"
+  crates/winnet/src/openvpn.rs` — по-прежнему ровно одна пара
+  (`build_gui_command`/`run_gui_command`), без изменений с прошлого
+  раунда.
+- `%TEMP%` после полного прогона тестов не содержит осиротевших
+  `proxypilot-test-openvpn-*`.
+- Ни `openvpn-gui.exe`, ни живой `connect`/`disconnect`, ни запись в
+  реестр (`HKLM`/`HKCU`) в этом раунде не выполнялись — ровно как и в
+  первом.

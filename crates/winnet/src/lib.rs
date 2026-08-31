@@ -35,7 +35,7 @@ pub enum WinNetError {
     OpenVpnNotFound { gui_exe: std::path::PathBuf },
     /// `openvpn-gui.exe --command …` не удалось запустить — сам процесс
     /// не стартовал. Не путать с тем, что подключение не удалось: это
-    /// узнать отсюда нельзя (см. докблок `openvpn::TunnelStatus`).
+    /// узнать отсюда нельзя (см. докблок `openvpn::ProfileStatus`).
     #[error("не удалось запустить {exe:?}: {source}")]
     OpenVpnGuiLaunch {
         exe: std::path::PathBuf,
