@@ -64,10 +64,13 @@ use proxypilot_bridge::supervisor::{AppState, NetworkSource, Supervisor, Supervi
 use proxypilot_core::bypass::BypassList;
 use proxypilot_core::config::Config;
 use proxypilot_core::mode::{ConnectedNetwork, Mode, Route};
+use proxypilot_core::net::Ipv4Net;
 use proxypilot_winnet::autostart;
 use proxypilot_winnet::com::ComGuard;
 use proxypilot_winnet::events::{debounce, watch_network_changes};
 use proxypilot_winnet::networks::list_connected;
+use proxypilot_winnet::openvpn::{self, ProfileStatus};
+use proxypilot_winnet::{routes as ip_routes, tunnel_state};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -363,7 +366,14 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
     // ниже: страж завершения сеанса обязан встать ДО того, как реестр
     // укажет на нас, иначе останется зазор, в котором конец сеанса некому
     // будет перехватить.
-    let tray = Tray::new(&initial).map_err(|e| format!("трей: {e}"))?;
+    // Единственный экземпляр на весь процесс — тот же самый нужен и трею
+    // (снимок в заголовке меню), и каждому открытию страницы настроек
+    // (`SettingsState.tunnel`): без состояния, поэтому клонировать `Arc`,
+    // а не заводить второй, безопасно и дёшево.
+    let tunnel: Arc<dyn settings_page::Tunnel> = Arc::new(WinTunnel);
+    let initial_tunnel_snapshot =
+        tunnel.snapshot(&cfg.office_subnets, settings_page::TUNNEL_PROFILE_NAME);
+    let tray = Tray::new(&initial, &initial_tunnel_snapshot).map_err(|e| format!("трей: {e}"))?;
     tray.install_session_end_guard();
 
     // Страж и обработчик консоли ставятся ДО `take_over`, а не после.
@@ -515,7 +525,15 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
         });
     }
 
-    match message_loop(&tray, &state, &saved_config, &commands, &runtime, port) {
+    match message_loop(
+        &tray,
+        &state,
+        &saved_config,
+        &commands,
+        &runtime,
+        port,
+        &tunnel,
+    ) {
         Exit::User => {
             info!("выход по команде пользователя");
             Ok(())
@@ -764,6 +782,121 @@ impl settings_page::Autostart for WinAutostart {
     }
 }
 
+/// Имя файла, откуда «Собрать профиль» берёт исходный `.ovpn` (сертификаты,
+/// адрес сервера — то, что выдаёт офисный администратор). Кладётся ровно
+/// туда же, куда OpenVPN GUI и так умеет сохранять профили без прав
+/// администратора (докблок `settings_page::Tunnel`), под именем, которое не
+/// совпадёт ни с одним профилем пользователя и ни с нашим собственным
+/// выходом (`TUNNEL_PROFILE_NAME`, `settings_page.rs`).
+///
+/// Больше нигде в проекте это имя не специфицировано: ни один из планов
+/// 1-6 не назвал источник `ovpn_profile::build_profile`, а первым реальным
+/// вызывающим стала именно эта задача — см. отчёт задачи 7.
+const TUNNEL_SOURCE_FILE: &str = "proxypilot-source.ovpn";
+
+/// Реализация [`settings_page::Tunnel`] поверх `proxypilot_winnet`.
+///
+/// Без состояния: каждый вызов заново читает систему (`find_installation`,
+/// `profile_status`, живую таблицу маршрутов) — тот же принцип, что и у
+/// `openvpn.rs` (`ensure_still_installed` на каждом вызове, а не однажды
+/// найденный `Installation`, который могли снести между поиском и
+/// использованием).
+struct WinTunnel;
+
+impl WinTunnel {
+    /// Живой список адаптеров-маршрутов для `tunnel_state`, с честным
+    /// признаком отказа чтения — `snapshot` обязана СКАЗАТЬ, что не смогла
+    /// проверить чужой туннель, а не тихо посчитать, что его нет.
+    fn adapters() -> Result<Vec<tunnel_state::AdapterRoute>, String> {
+        ip_routes::gather_ipv4_routes().map_err(|e| e.to_string())
+    }
+}
+
+impl settings_page::Tunnel for WinTunnel {
+    fn snapshot(
+        &self,
+        office_subnets: &[Ipv4Net],
+        profile_name: &str,
+    ) -> settings_page::TunnelSnapshot {
+        let Ok(Some(inst)) = openvpn::find_installation() else {
+            return settings_page::TunnelSnapshot::default();
+        };
+        let profile_installed = matches!(
+            openvpn::profile_status(&inst, profile_name),
+            Ok(ProfileStatus::Installed)
+        );
+        match Self::adapters() {
+            Ok(adapters) => settings_page::TunnelSnapshot {
+                installed: true,
+                profile_installed,
+                our_tunnel_up: tunnel_state::our_tunnel_up(&adapters, profile_name),
+                foreign_tunnel_up: tunnel_state::foreign_tunnel_up(
+                    office_subnets,
+                    &adapters,
+                    profile_name,
+                ),
+                routes_error: None,
+            },
+            Err(e) => settings_page::TunnelSnapshot {
+                installed: true,
+                profile_installed,
+                our_tunnel_up: false,
+                foreign_tunnel_up: false,
+                routes_error: Some(e),
+            },
+        }
+    }
+
+    fn build_profile(&self, profile_name: &str, office_subnets: &[Ipv4Net]) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        let source_path = inst.config_dir.join(TUNNEL_SOURCE_FILE);
+        let source = std::fs::read_to_string(&source_path).map_err(|e| {
+            format!(
+                "не найден файл источника {}: {e}. Положите свой .ovpn \
+                 (сертификаты, адрес сервера — то, что выдал администратор) \
+                 туда под этим именем и нажмите «Собрать профиль» ещё раз.",
+                source_path.display()
+            )
+        })?;
+        openvpn::build_and_install_profile(&inst, profile_name, &source, office_subnets)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn raise(&self, profile_name: &str) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        openvpn::connect(&inst, profile_name).map_err(|e| e.to_string())
+    }
+
+    fn lower(&self, profile_name: &str) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        openvpn::disconnect(&inst, profile_name).map_err(|e| e.to_string())
+    }
+
+    fn install_service(&self) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        ui::request_elevation(&exe, "install-service")
+    }
+}
+
+/// Общая часть, которую `open_settings` собирает в `SettingsState` заново
+/// при каждом открытии страницы — все шесть значений всегда идут вместе, и
+/// ни один вызывающий (`message_loop`) не передаёт их по отдельности.
+struct SettingsDeps<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    state: &'a Arc<ArcSwap<AppState>>,
+    saved_config: &'a Arc<ArcSwap<Config>>,
+    commands: &'a mpsc::Sender<Cmd>,
+    bound_port: u16,
+    tunnel: &'a Arc<dyn settings_page::Tunnel>,
+}
+
 /// Открывает страницу настроек: поднимает сервер, если его нет, и зовёт
 /// браузер.
 ///
@@ -782,34 +915,33 @@ impl settings_page::Autostart for WinAutostart {
 ///
 /// Отказ не смертелен — приложение продолжает работать, — но и молчать о
 /// нём нельзя: человек нажал пункт меню и ждёт окна.
-fn open_settings(
-    runtime: &tokio::runtime::Runtime,
-    state: &Arc<ArcSwap<AppState>>,
-    saved_config: &Arc<ArcSwap<Config>>,
-    commands: &mpsc::Sender<Cmd>,
-    bound_port: u16,
-    server: &mut Option<websrv::Server>,
-    section: Option<&str>,
-) {
+///
+/// Параметры собраны в [`SettingsDeps`], а не переданы по отдельности:
+/// добавление `tunnel` (задача 7) перевалило их число за предел
+/// `clippy::too_many_arguments` (7) — не обход находки, а обычная
+/// группировка: все шесть всегда идут вместе, ни один вызывающий не
+/// передаёт их по отдельности.
+fn open_settings(deps: &SettingsDeps, server: &mut Option<websrv::Server>, section: Option<&str>) {
     if !server.as_ref().is_some_and(|s| s.is_running()) {
         let shared = Arc::new(settings_page::SettingsState {
             // Та же ячейка, что читает трей, а не копия: разойдись они —
             // и меню со страницей показывали бы разное состояние.
-            app: Arc::clone(state),
-            config: Arc::clone(saved_config),
+            app: Arc::clone(deps.state),
+            config: Arc::clone(deps.saved_config),
             // Единственный путь применить изменение — тот же канал, которым
             // ходят трей и подписка на смену сети.
-            commands: commands.clone(),
+            commands: deps.commands.clone(),
             // Порт, на котором слушатель уже привязан. Страница обязана
             // знать именно его, а не то, что записано в конфиге: разойтись
             // они могут ровно на одну правку — ту, что требует перезапуска.
-            bound_port,
+            bound_port: deps.bound_port,
             autostart: Arc::new(WinAutostart),
+            tunnel: Arc::clone(deps.tunnel),
         });
         // `block_on` с главного потока безопасен: он не внутри рантайма, а
         // сама привязка слушателя занимает микросекунды — цикл сообщений
         // этого не заметит.
-        match runtime.block_on(websrv::Server::start(shared)) {
+        match deps.runtime.block_on(websrv::Server::start(shared)) {
             Ok(s) => {
                 server.replace(s);
             }
@@ -857,11 +989,20 @@ fn message_loop(
     commands: &mpsc::Sender<Cmd>,
     runtime: &tokio::runtime::Runtime,
     bound_port: u16,
+    tunnel: &Arc<dyn settings_page::Tunnel>,
 ) -> Exit {
     let mut msg = MSG::default();
     // Сервер настроек живёт ровно столько, сколько живёт эта переменная:
     // выход из цикла — любой из четырёх — уничтожает её вместе с дверью.
     let mut settings: Option<websrv::Server> = None;
+    let deps = SettingsDeps {
+        runtime,
+        state,
+        saved_config,
+        commands,
+        bound_port,
+        tunnel,
+    };
     loop {
         // До блокирующего ожидания: мост мог умереть ещё до того, как мы
         // сюда дошли, и тогда ждать сообщений незачем.
@@ -893,7 +1034,15 @@ fn message_loop(
         }
         if msg.message == WM_STATE_CHANGED {
             let snapshot = state.load();
-            tray.refresh(&snapshot);
+            // Живой снимок туннеля — те же чтения (реестр, файловая
+            // система, таблица маршрутов), что и на странице настроек, тут
+            // же на главном потоке: все они быстрые локальные вызовы без
+            // сети, тем же приёмом, что и `icon_for`/`network_text` рядом.
+            let tunnel_snapshot = tunnel.snapshot(
+                &saved_config.load().office_subnets,
+                settings_page::TUNNEL_PROFILE_NAME,
+            );
+            tray.refresh(&snapshot, &tunnel_snapshot);
         }
 
         // SAFETY: `msg` заполнена успешным `GetMessageW` и не изменялась.
@@ -915,33 +1064,10 @@ fn message_loop(
             match tray.action_for(event.id()) {
                 Some(Action::Quit) => return Exit::User,
                 Some(Action::CopyAddress) => tray.copy_address(),
-                Some(Action::OpenSettings) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    None,
-                ),
-                Some(Action::OpenBench) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    Some("bench"),
-                ),
-                Some(Action::OpenDoctor) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    Some("doctor"),
-                ),
+                Some(Action::OpenSettings) => open_settings(&deps, &mut settings, None),
+                Some(Action::OpenBench) => open_settings(&deps, &mut settings, Some("bench")),
+                Some(Action::OpenDoctor) => open_settings(&deps, &mut settings, Some("doctor")),
+                Some(Action::OpenTunnel) => open_settings(&deps, &mut settings, Some("tunnel")),
                 Some(Action::SetMode(mode)) => {
                     // `try_send`, а не `blocking_send`: главный поток обязан
                     // вернуться в цикл сообщений — застрявший цикл выглядит

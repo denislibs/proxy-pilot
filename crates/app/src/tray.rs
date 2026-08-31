@@ -41,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::icons::{icon_for, rgba, IconKind, ICON_SIDE};
+use crate::settings_page::TunnelSnapshot;
 
 /// Оконная процедура, которая стояла на окне трея ДО нашей подмены.
 /// Глобальная — потому что новой процедуре (`session_end_wndproc`, это
@@ -96,6 +97,11 @@ pub enum Action {
     OpenBench,
     /// То же самое для раздела диагностики (`#doctor`).
     OpenDoctor,
+    /// То же самое для раздела туннеля (`#tunnel`, задача 7) — управление
+    /// (поднять/опустить, собрать профиль, установить службу) живёт там же,
+    /// не в самом меню: там есть место для предупреждений (про UAC, про
+    /// DNS, про чужой туннель), а пункт меню — это одна строка без него.
+    OpenTunnel,
     Quit,
 }
 
@@ -155,6 +161,30 @@ pub fn network_text(state: &AppState) -> String {
     }
 }
 
+/// Строка про туннель — короткая версия того же снимка, что подробно
+/// разбирает раздел «Туннель» на странице настроек: пункт меню это одна
+/// строка, места на предупреждения (про DNS, про UAC, про чужой туннель) в
+/// ней нет — за подробностями пункт `Action::OpenTunnel` ведёт туда же.
+pub fn tunnel_text(snap: &TunnelSnapshot) -> String {
+    if !snap.installed {
+        return "Туннель: OpenVPN не установлен".to_string();
+    }
+    if snap.routes_error.is_some() {
+        return "Туннель: состояние неизвестно".to_string();
+    }
+    if snap.foreign_tunnel_up {
+        return "Туннель: обнаружен чужой".to_string();
+    }
+    if snap.our_tunnel_up {
+        return "Туннель: поднят".to_string();
+    }
+    if snap.profile_installed {
+        "Туннель: опущен".to_string()
+    } else {
+        "Туннель: опущен · профиль не собран".to_string()
+    }
+}
+
 fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Auto => "Авто",
@@ -189,10 +219,15 @@ pub struct Tray {
     /// неактивный: это надпись, а кнопка «эта сеть — офис» (спека 6.1) живёт
     /// на странице настроек — там же, где конфиг, в который она пишет.
     network: MenuItem,
+    /// Короткий снимок состояния туннеля (см. `tunnel_text`). Тоже
+    /// неактивная надпись — управление (кнопки, предупреждения про DNS и
+    /// UAC) живёт на странице настроек, куда ведёт `open_tunnel` ниже.
+    tunnel: MenuItem,
     modes: Vec<(Mode, CheckMenuItem)>,
     settings: MenuItem,
     bench: MenuItem,
     doctor: MenuItem,
+    open_tunnel: MenuItem,
     copy: MenuItem,
     quit: MenuItem,
     /// Какая иконка сейчас нарисована. `Shell_NotifyIcon` на каждое
@@ -206,9 +241,10 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(state: &AppState) -> Result<Self, String> {
+    pub fn new(state: &AppState, tunnel: &TunnelSnapshot) -> Result<Self, String> {
         let header = MenuItem::new(header_text(state), false, None);
         let network = MenuItem::new(network_text(state), false, None);
+        let tunnel_item = MenuItem::new(tunnel_text(tunnel), false, None);
         let modes: Vec<(Mode, CheckMenuItem)> = MODES
             .iter()
             .map(|&m| {
@@ -219,19 +255,21 @@ impl Tray {
             })
             .collect();
         let settings = MenuItem::new("Настройки…", true, None);
-        // «Замерить скорость…» и «Диагностика…» — та же страница настроек,
-        // открытая сразу на нужном разделе (спека 11.2 отдаёт им якорь
-        // `#bench`/`#doctor`, а не отдельный сервер): второго входа в
-        // приложение заводить незачем, а держать его — значит держать
-        // второй токен и второй слушатель loopback.
+        // «Замерить скорость…», «Диагностика…» и «Туннель…» — та же
+        // страница настроек, открытая сразу на нужном разделе (спека 11.2
+        // отдаёт им якорь `#bench`/`#doctor`/`#tunnel`, а не отдельный
+        // сервер): второго входа в приложение заводить незачем, а держать
+        // его — значит держать второй токен и второй слушатель loopback.
         let bench = MenuItem::new("Замерить скорость…", true, None);
         let doctor = MenuItem::new("Диагностика…", true, None);
+        let open_tunnel = MenuItem::new("Туннель…", true, None);
         let copy = MenuItem::new("Копировать адрес моста", true, None);
         let quit = MenuItem::new("Выход", true, None);
 
         let menu = Menu::new();
         menu.append(&header).map_err(|e| e.to_string())?;
         menu.append(&network).map_err(|e| e.to_string())?;
+        menu.append(&tunnel_item).map_err(|e| e.to_string())?;
         // Каждому разделителю — свой экземпляр: у `muda` пункт меню несёт
         // собственный идентификатор и состояние, и один и тот же объект,
         // добавленный в меню трижды, — не три разделителя, а одна запись,
@@ -246,6 +284,7 @@ impl Tray {
         menu.append(&settings).map_err(|e| e.to_string())?;
         menu.append(&bench).map_err(|e| e.to_string())?;
         menu.append(&doctor).map_err(|e| e.to_string())?;
+        menu.append(&open_tunnel).map_err(|e| e.to_string())?;
         menu.append(&copy).map_err(|e| e.to_string())?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(|e| e.to_string())?;
@@ -263,10 +302,12 @@ impl Tray {
             icon,
             header,
             network,
+            tunnel: tunnel_item,
             modes,
             settings,
             bench,
             doctor,
+            open_tunnel,
             copy,
             quit,
             shown: Cell::new(Some(kind)),
@@ -275,11 +316,12 @@ impl Tray {
     }
 
     /// Приводит меню и иконку в соответствие свежему состоянию.
-    pub fn refresh(&self, state: &AppState) {
+    pub fn refresh(&self, state: &AppState, tunnel: &TunnelSnapshot) {
         self.port.set(state.port);
         let text = header_text(state);
         self.header.set_text(&text);
         self.network.set_text(network_text(state));
+        self.tunnel.set_text(tunnel_text(tunnel));
         if let Err(e) = self.icon.set_tooltip(Some(&text)) {
             warn!(error = %e, "не обновить подсказку иконки");
         }
@@ -329,6 +371,9 @@ impl Tray {
         }
         if id == self.doctor.id() {
             return Some(Action::OpenDoctor);
+        }
+        if id == self.open_tunnel.id() {
+            return Some(Action::OpenTunnel);
         }
         self.modes
             .iter()
@@ -542,6 +587,14 @@ mod tests {
         }
     }
 
+    /// «OpenVPN не установлен» — тот же снимок, что и `TunnelSnapshot::default()`
+    /// (все поля `false`/`None`), но по имени, а не по умолчанию: тесты,
+    /// которым сам туннель безразличен, не должны зависеть от того, что
+    /// значит пустое значение каждого поля структуры.
+    fn no_tunnel() -> TunnelSnapshot {
+        TunnelSnapshot::default()
+    }
+
     #[test]
     fn the_network_line_shows_the_name_and_marks_the_office() {
         // Голый GUID в меню бесполезен: сверять человек будет с тем именем,
@@ -647,7 +700,8 @@ mod tests {
 
     #[test]
     fn opening_the_speed_test_and_diagnostics_are_distinct_actions() {
-        let t = Tray::new(&state(Route::Direct, false)).expect("трей строится в этом окружении");
+        let t = Tray::new(&state(Route::Direct, false), &no_tunnel())
+            .expect("трей строится в этом окружении");
         assert_eq!(
             t.action_for(t.bench.id()),
             Some(Action::OpenBench),
@@ -658,10 +712,17 @@ mod tests {
             Some(Action::OpenDoctor),
             "пункт «Диагностика…» обязан вести на диагностику"
         );
+        assert_eq!(
+            t.action_for(t.open_tunnel.id()),
+            Some(Action::OpenTunnel),
+            "пункт «Туннель…» обязан вести на раздел туннеля"
+        );
         // Разные пункты — разные действия: если бы оба пункта случайно
         // получили один и тот же `MenuId::new()` по ошибке копипаста,
         // это сравнение бы это поймало.
         assert_ne!(t.bench.id(), t.doctor.id());
+        assert_ne!(t.bench.id(), t.open_tunnel.id());
+        assert_ne!(t.doctor.id(), t.open_tunnel.id());
     }
 
     #[test]
@@ -669,8 +730,10 @@ mod tests {
         // Меню строилось по двум предыдущим планам: режимы с индикаторами
         // доступности, «Настройки…», копирование адреса и «Выход» обязаны
         // остаться на месте и вести на прежние действия после того, как
-        // задача 5 вставила в это же меню два новых пункта.
-        let t = Tray::new(&state(Route::Direct, false)).expect("трей строится в этом окружении");
+        // задача 5, а следом и задача 7, вставили в это же меню новые
+        // пункты.
+        let t = Tray::new(&state(Route::Direct, false), &no_tunnel())
+            .expect("трей строится в этом окружении");
         assert_eq!(t.action_for(t.quit.id()), Some(Action::Quit));
         assert_eq!(t.action_for(t.copy.id()), Some(Action::CopyAddress));
         assert_eq!(t.action_for(t.settings.id()), Some(Action::OpenSettings));
@@ -679,5 +742,59 @@ mod tests {
         }
         // Неизвестный id — не пункт этого меню вовсе, а не случайное совпадение.
         assert_eq!(t.action_for(&MenuId::new("несуществующий-пункт")), None);
+    }
+
+    // ---- Задача 7: строка про туннель ----
+
+    #[test]
+    fn tunnel_text_explains_a_missing_openvpn() {
+        assert!(tunnel_text(&no_tunnel()).contains("не установлен"));
+    }
+
+    #[test]
+    fn tunnel_text_names_a_down_tunnel() {
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            ..Default::default()
+        };
+        let t = tunnel_text(&snap);
+        assert!(t.contains("опущен"), "получили: {t}");
+    }
+
+    #[test]
+    fn tunnel_text_names_our_tunnel_up() {
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            our_tunnel_up: true,
+            ..Default::default()
+        };
+        assert_eq!(tunnel_text(&snap), "Туннель: поднят");
+    }
+
+    #[test]
+    fn tunnel_text_warns_about_a_foreign_tunnel() {
+        let snap = TunnelSnapshot {
+            installed: true,
+            foreign_tunnel_up: true,
+            ..Default::default()
+        };
+        let t = tunnel_text(&snap);
+        assert!(t.contains("чужой"), "получили: {t}");
+    }
+
+    #[test]
+    fn tunnel_text_reports_an_unreadable_route_table_honestly() {
+        // Не выдаёт «поднят»/«опущен» увереннее, чем знает: не сумели
+        // прочитать таблицу маршрутов — состояние неизвестно, а не «опущен»
+        // по умолчанию.
+        let snap = TunnelSnapshot {
+            installed: true,
+            routes_error: Some("тестовый отказ".to_string()),
+            ..Default::default()
+        };
+        let t = tunnel_text(&snap);
+        assert!(t.contains("неизвестно"), "получили: {t}");
     }
 }

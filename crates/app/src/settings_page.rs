@@ -46,6 +46,7 @@ use proxypilot_bridge::bench::{bench_all, fastest, BenchResult};
 use proxypilot_bridge::supervisor::AppState;
 use proxypilot_core::config::{Config, OfficeNetwork};
 use proxypilot_core::mode::{Mode, Reachability, Route};
+use proxypilot_core::net::Ipv4Net;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -76,6 +77,88 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Сколько ждём ответа от собственного порта при живой диагностике.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Имя нашего профиля в OpenVPN — то же значение, что уходит и в имя файла
+/// (`<name>.ovpn`, `winnet::openvpn::install_profile`), и в
+/// `--command connect|disconnect <name>` (`docs/design.md` §8.3), и в
+/// `tunnel_state::{our_tunnel_up, foreign_tunnel_up}` как `our_alias`.
+///
+/// Задача 3 записала прямо: псевдоним интерфейса Windows — НЕ устойчивый
+/// идентификатор (переименовываем пользователем, разные API показывают его
+/// по-разному), и ничто в проекте до этой задачи не определяло, что
+/// подставлять сюда. Это имя — лучшее доступное предположение, а не
+/// гарантия: OpenVPN не обязан назвать сетевой адаптер точно так же, как
+/// файл профиля (совпадение зависит от настроек OpenVPN GUI и от того, не
+/// переименовал ли адаптер сам пользователь). Страница говорит об этом
+/// прямо, а не выдаёт «поднят/опущен» как более достоверный факт, чем он
+/// есть на самом деле (см. текст в [`tunnel_section`]).
+pub const TUNNEL_PROFILE_NAME: &str = "proxypilot-office";
+
+/// Доступ к OpenVPN-туннелю и к установке службы статического IP с точки
+/// зрения страницы настроек.
+///
+/// Реальная реализация (`WinTunnel` в `main.rs`) вызывает
+/// `proxypilot_winnet::{openvpn, routes, tunnel_state}` и `ShellExecuteW` с
+/// verb `runas` для установки службы. Тестовая (`FakeTunnel`, ниже) отдаёт
+/// заранее заданный снимок и ничего не трогает — ни диск, ни реестр, ни
+/// `openvpn-gui.exe`. Абстракция обязательна, не по вкусу: если бы тесты
+/// этой страницы звали настоящую реализацию, `cargo test` на машине, где
+/// OpenVPN установлен (а он установлен на машине, где велась эта сессия —
+/// см. отчёт задачи 1), реально запускал бы `openvpn-gui.exe --command
+/// connect`, писал файлы в каталог конфигураций OpenVPN и мог бы попытаться
+/// повысить права — ровно то, что `CLAUDE.md` запрещает агенту делать на
+/// этой машине.
+pub trait Tunnel: Send + Sync {
+    /// Снимок состояния — только чтение (реестр, файловая система, живая
+    /// таблица маршрутов), безопасно вызывать когда угодно и как угодно
+    /// часто.
+    fn snapshot(&self, office_subnets: &[Ipv4Net], profile_name: &str) -> TunnelSnapshot;
+    /// Собирает split-tunnel профиль (`ovpn_profile::build_profile`,
+    /// ошибка которого не проглатывается — доходит до пользователя как
+    /// есть) и кладёт его в каталог конфигураций OpenVPN
+    /// (`openvpn::build_and_install_profile`). Прав администратора не
+    /// требует: каталог конфигураций OpenVPN доступен на запись обычному
+    /// пользователю (иначе окно OpenVPN GUI, рассчитанное на запуск без
+    /// UAC, не смогло бы сохранять профили).
+    fn build_profile(&self, profile_name: &str, office_subnets: &[Ipv4Net]) -> Result<(), String>;
+    /// `Ok` значит только «команда передана `openvpn-gui.exe`», не «туннель
+    /// поднят» — тот же контракт, что у `openvpn::connect`.
+    fn raise(&self, profile_name: &str) -> Result<(), String>;
+    fn lower(&self, profile_name: &str) -> Result<(), String>;
+    /// Запускает `<этот же .exe> install-service` с запросом повышения прав
+    /// (`ShellExecuteW`, verb `runas`) — единственный путь к UAC во всём
+    /// приложении (`CLAUDE.md`, «Права администратора»). `Ok` значит только
+    /// «запрос ушёл в Windows», не «служба установлена»: принять/отклонить
+    /// диалог UAC и саму регистрацию видит уже не эта функция.
+    fn install_service(&self) -> Result<(), String>;
+}
+
+/// Что странице нужно знать об OpenVPN-туннеле для отрисовки. Не то же
+/// самое, что `openvpn::ProfileStatus` — тот отвечает «есть ли файл
+/// профиля на диске», а не «поднят ли туннель» (докблок `ProfileStatus`);
+/// здесь оба факта разложены по разным полям намеренно, чтобы не повторить
+/// ту же путаницу, ради которой `ProfileStatus` был переименован из
+/// `TunnelStatus`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelSnapshot {
+    /// OpenVPN не найден на машине вовсе — прочие поля смысла не имеют,
+    /// раздел неактивен целиком.
+    pub installed: bool,
+    /// Файл `<profile_name>.ovpn` есть в каталоге конфигураций OpenVPN.
+    pub profile_installed: bool,
+    /// `tunnel_state::our_tunnel_up` — есть туннельный адаптер с нашим
+    /// (предполагаемым, см. [`TUNNEL_PROFILE_NAME`]) псевдонимом.
+    pub our_tunnel_up: bool,
+    /// `tunnel_state::foreign_tunnel_up` — чужой туннель уже несёт наши
+    /// офисные подсети.
+    pub foreign_tunnel_up: bool,
+    /// Не удалось прочитать живую таблицу маршрутов — про поднятость (свою
+    /// и чужую) сказать нечего честно. `Some` гасит обе кнопки (подъёма и
+    /// опускания): предложить подъём, не умея проверить чужой туннель,
+    /// значило бы нарушить прямо то правило, ради которого эта проверка
+    /// вообще существует (задача 3, приёмка задачи 7).
+    pub routes_error: Option<String>,
+}
+
 /// Тумблер автозапуска.
 ///
 /// Трейт, а не прямой вызов `winnet::autostart`: настоящая реализация
@@ -104,6 +187,37 @@ impl Autostart for AutostartPending {
 
     fn set(&self, _on: bool) -> Result<(), String> {
         Err("автозапуск ещё не подключён в этой сборке".to_string())
+    }
+}
+
+/// Заглушка `Tunnel` для тестов, которым сам туннель безразличен (например,
+/// тесты `websrv.rs`, проверяющие транспорт, а не раздел «Туннель»): всегда
+/// «OpenVPN не найден», действия отказывают явным текстом, а не молчат.
+/// Только для тестов — публична ради сборки тестов из других файлов крейта
+/// (`websrv.rs`), тем же приёмом, что и `AutostartPending`.
+#[cfg(test)]
+pub struct TunnelPending;
+
+#[cfg(test)]
+impl Tunnel for TunnelPending {
+    fn snapshot(&self, _office_subnets: &[Ipv4Net], _profile_name: &str) -> TunnelSnapshot {
+        TunnelSnapshot::default()
+    }
+    fn build_profile(
+        &self,
+        _profile_name: &str,
+        _office_subnets: &[Ipv4Net],
+    ) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn raise(&self, _profile_name: &str) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn lower(&self, _profile_name: &str) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn install_service(&self) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
     }
 }
 
@@ -173,6 +287,8 @@ pub struct SettingsState {
     /// Порт, на котором мост слушает СЕЙЧАС и до конца жизни процесса.
     pub bound_port: u16,
     pub autostart: Arc<dyn Autostart>,
+    /// OpenVPN-туннель и установка службы статического IP (задача 7).
+    pub tunnel: Arc<dyn Tunnel>,
 }
 
 /// Что показать над формой после действия.
@@ -377,6 +493,10 @@ pub fn config_from_form(base: &Config, form: &Form) -> Result<Config, String> {
         no_proxy: normalise_bypass(form.get("no_proxy").unwrap_or_default()),
         manage_system_proxy: form.checked("manage_system_proxy"),
         office_networks,
+        // Спека 8.5: по умолчанию выключено — форма не присылает поле
+        // вовсе, пока человек его не отметил (`Form::checked`), и тогда
+        // `false` — то же самое значение, что и `Config::default()`.
+        automate_tunnel: form.checked("automate_tunnel"),
         // Всё остальное — из текущего конфига, а не из формы, и это не
         // экономия. `mode` переключает трей; тайминги и предел соединений
         // правятся файлом; `saved_sysproxy` — единственный след системных
@@ -510,6 +630,18 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
     b.push_str(&office_row("", ""));
     b.push_str("</table>\n");
 
+    b.push_str("<h2 id=\"tunnel-automation\">Автоматика туннеля</h2>\n");
+    b.push_str(&checkbox(
+        "automate_tunnel",
+        "Поднимать туннель автоматически вне офиса",
+        cfg.automate_tunnel,
+        false,
+        "Выключено по умолчанию (спека 8.5) — туннель поднимается руками, пока \
+         вы не включите это сами. Пока только сохраняет намерение: сам подъём и \
+         опускание по смене сети этот тумблер ещё не выполняет — управляйте \
+         туннелем кнопками ниже.",
+    ));
+
     b.push_str("<h2 id=\"bypass\">Мимо прокси</h2>\n");
     b.push_str(&format!(
         "<label for=\"no_proxy\">Адреса и подсети, по одному в строке или через \
@@ -564,6 +696,14 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         ));
     }
     b.push_str("</p>\n</form>\n");
+
+    // Раздел «Туннель» — отдельными формами по той же причине, что и замер
+    // и диагностика ниже: каждая кнопка не должна тащить с собой поля
+    // настроек, которые человек ещё правит.
+    let tunnel_snapshot = state
+        .tunnel
+        .snapshot(&cfg.office_subnets, TUNNEL_PROFILE_NAME);
+    b.push_str(&tunnel_section(&cfg.office_subnets, &tunnel_snapshot));
 
     // Замер и диагностика — отдельными формами: их кнопки не должны
     // отправлять поля настроек, которые человек ещё правит.
@@ -642,6 +782,130 @@ fn office_row(id: &str, name: &str) -> String {
          <td><input type=\"text\" name=\"office_name\" value=\"{name}\"></td></tr>\n",
         id = escape_html(id),
         name = escape_html(name),
+    )
+}
+
+/// Раздел «Туннель»: где мы стоим (OpenVPN найден? профиль собран?
+/// поднято?), явное предупреждение про DNS до подъёма (спека 8.2), и
+/// кнопки — свои, отдельными формами (см. комментарий в `render`).
+///
+/// Если поднят чужой туннель в наши сети — кнопка подъёма не рисуется
+/// вовсе (приёмка задачи 7): показывать кнопку, которая приведёт к двум
+/// туннелям, спорящим за маршруты, значит предлагать человеку то, что мы
+/// уже знаем — плохая идея.
+fn tunnel_section(office_subnets: &[Ipv4Net], snap: &TunnelSnapshot) -> String {
+    let mut b = String::new();
+    b.push_str("<h2 id=\"tunnel\">Туннель (OpenVPN)</h2>\n");
+
+    if !snap.installed {
+        // Приёмка: раздел неактивен с внятным объяснением, а не просто
+        // серый — дальше в разделе рисовать нечего, все прочие поля снимка
+        // не имеют смысла без установленного OpenVPN.
+        b.push_str(
+            "<p class=\"hint\">OpenVPN не найден на этой машине — раздел \
+             недоступен. Установите OpenVPN (openvpn.net/community-downloads) \
+             и откройте эту страницу снова.</p>\n",
+        );
+        return b;
+    }
+
+    if office_subnets.is_empty() {
+        b.push_str(
+            "<p class=\"hint\">Офисные подсети не заданы — маршруты в профиль \
+             не добавятся (раздел «Апстримы» их не хранит; правится файлом \
+             конфига).</p>\n",
+        );
+    } else {
+        let list = office_subnets
+            .iter()
+            .map(Ipv4Net::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        b.push_str(&format!(
+            "<p class=\"hint\">Через туннель маршрутизируются подсети: {}.</p>\n",
+            escape_html(&list)
+        ));
+    }
+
+    let profile_word = if snap.profile_installed {
+        "установлен"
+    } else {
+        "не собран"
+    };
+    // Честность про то, что «поднято» ниже держится на предположении, а не
+    // на гарантии — задача 3 записала это про псевдоним адаптера прямо в
+    // докблок `tunnel_state`, и страница обязана унаследовать ту же
+    // осторожность, а не выдавать статус увереннее, чем он есть.
+    b.push_str(&format!(
+        "<p>Профиль в OpenVPN: <b>{profile_word}</b> (имя «{}»; статус ниже \
+         определён по этому предположению — Windows не гарантирует, что \
+         адаптер называется именно так).</p>\n",
+        escape_html(TUNNEL_PROFILE_NAME)
+    ));
+
+    // Приёмка: пользователь узнаёт про DNS ДО подъёма, а не догадывается —
+    // показывается всегда, а не только когда туннель уже поднят.
+    b.push_str(
+        "<p class=\"warn\">Пока туннель поднят, все DNS-запросы уходят в офис \
+         — так резолвятся внутренние имена (git, dev-серверы), и это \
+         осознанная плата (спека 8.2). Вне туннеля резолвинг снова \
+         обычный.</p>\n",
+    );
+
+    if let Some(err) = &snap.routes_error {
+        b.push_str(&format!(
+            "<p class=\"note bad\">Не удалось прочитать таблицу маршрутов: {} \
+             — состояние туннеля неизвестно, кнопки подъёма и опускания \
+             скрыты, пока это не исправится.</p>\n",
+            escape_html(err)
+        ));
+    } else if snap.foreign_tunnel_up {
+        b.push_str(
+            "<p class=\"note bad\">Обнаружен ЧУЖОЙ туннель, уже несущий \
+             офисные подсети (другой VPN, Tailscale, WireGuard...). \
+             Поднимать свой нельзя — два туннеля будут спорить за маршруты. \
+             Опустите тот, что уже поднят, и вернитесь сюда.</p>\n",
+        );
+    } else if snap.our_tunnel_up {
+        b.push_str("<p class=\"note good\">Туннель поднят.</p>\n");
+        b.push_str(&tunnel_action_form("lower_tunnel", "Опустить туннель"));
+    } else {
+        b.push_str("<p>Туннель опущен.</p>\n");
+        if snap.profile_installed {
+            b.push_str(&tunnel_action_form("raise_tunnel", "Поднять туннель"));
+        } else {
+            b.push_str("<p class=\"hint\">Сначала соберите профиль — кнопка ниже.</p>\n");
+        }
+    }
+
+    // Приёмка: явное предупреждение про UAC у обеих кнопок, ДО нажатия —
+    // одним абзацем перед обеими, а не после клика.
+    b.push_str(
+        "<p class=\"hint\">Кнопки ниже выходят за рамки обычной работы \
+         приложения. «Собрать профиль» пишет .ovpn-файл в каталог \
+         конфигураций OpenVPN — прав администратора не нужно, окна UAC не \
+         будет. «Установить службу статического IP» — да, нужны права \
+         администратора: Windows покажет запрос UAC, единственный во всём \
+         приложении.</p>\n",
+    );
+    b.push_str(&tunnel_action_form(
+        "build_tunnel_profile",
+        "Собрать профиль",
+    ));
+    b.push_str(&tunnel_action_form(
+        "install_service",
+        "Установить службу статического IP…",
+    ));
+
+    b
+}
+
+fn tunnel_action_form(action: &str, label: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
+         value=\"{action}\">{label}</button></form>\n",
+        action = escape_html(action),
+        label = escape_html(label),
     )
 }
 
@@ -760,6 +1024,25 @@ pub async fn handle_post(state: &SettingsState, body: &[u8]) -> String {
             ..Default::default()
         },
         action @ ("save" | "office") => apply(state, &form, action == "office").await,
+        "build_tunnel_profile" => {
+            let cfg = state.config.load();
+            tunnel_outcome(
+                state
+                    .tunnel
+                    .build_profile(TUNNEL_PROFILE_NAME, &cfg.office_subnets),
+                "Профиль собран и записан в каталог конфигураций OpenVPN.",
+            )
+        }
+        "raise_tunnel" => raise_tunnel(state).await,
+        "lower_tunnel" => tunnel_outcome(
+            state.tunnel.lower(TUNNEL_PROFILE_NAME),
+            "Команда на опускание туннеля отправлена OpenVPN GUI.",
+        ),
+        "install_service" => tunnel_outcome(
+            state.tunnel.install_service(),
+            "Запрос на установку службы отправлен — подтвердите запрос UAC, \
+             если Windows его покажет.",
+        ),
         other => Outcome::bad(format!("неизвестное действие «{other}»")),
     };
     render(state, Some(&outcome))
@@ -855,6 +1138,48 @@ async fn apply(state: &SettingsState, form: &Form, add_current_network: bool) ->
         notes,
         ..Default::default()
     }
+}
+
+/// Единственный результат одной кнопки раздела «Туннель» — успех или отказ,
+/// дословно из [`Tunnel`] (приёмка задачи 7: ошибка `build_profile` не
+/// проглатывается, а доходит до человека как есть).
+fn tunnel_outcome(result: Result<(), String>, ok_text: &str) -> Outcome {
+    match result {
+        Ok(()) => Outcome {
+            notes: vec![Note {
+                bad: false,
+                text: ok_text.to_string(),
+            }],
+            ..Default::default()
+        },
+        Err(e) => Outcome::bad(e),
+    }
+}
+
+/// Обработчик «Поднять туннель» — со свежей проверкой чужого туннеля НЕ
+/// только на уровне разметки (кнопка отсутствует, если он поднят), но и
+/// здесь: прямой POST в обход кнопки (например, повторно отправленная
+/// старая форма) не должен обойти правило «не предлагать подъём», пока
+/// чужой туннель несёт наши подсети (задача 3, приёмка задачи 7).
+async fn raise_tunnel(state: &SettingsState) -> Outcome {
+    let cfg = state.config.load();
+    let snap = state
+        .tunnel
+        .snapshot(&cfg.office_subnets, TUNNEL_PROFILE_NAME);
+    if let Some(err) = &snap.routes_error {
+        return Outcome::bad(format!(
+            "не удалось прочитать таблицу маршрутов: {err} — подъём отменён"
+        ));
+    }
+    if snap.foreign_tunnel_up {
+        return Outcome::bad(
+            "обнаружен чужой туннель, уже несущий офисные подсети — подъём отменён",
+        );
+    }
+    tunnel_outcome(
+        state.tunnel.raise(TUNNEL_PROFILE_NAME),
+        "Команда на подъём туннеля отправлена OpenVPN GUI.",
+    )
 }
 
 /// Тумблер автозапуска. Возвращает строку для показа, только если есть о чём
@@ -1133,6 +1458,7 @@ mod tests {
                 commands: tx,
                 bound_port: 3129,
                 autostart,
+                tunnel: Arc::new(FakeTunnel::new(TunnelSnapshot::default())),
             },
             rx,
         )
@@ -1394,5 +1720,343 @@ mod tests {
         let form = Form::parse(b"autostart=on");
         let note = apply_autostart(&state, &form).expect("человек ждёт результата");
         assert!(note.bad);
+    }
+
+    // ---- Задача 7: раздел «Туннель» ----
+
+    struct FakeTunnel {
+        snapshot: TunnelSnapshot,
+        build_result: Result<(), String>,
+        raise_result: Result<(), String>,
+        lower_result: Result<(), String>,
+        install_result: Result<(), String>,
+    }
+
+    impl FakeTunnel {
+        fn new(snapshot: TunnelSnapshot) -> Self {
+            Self {
+                snapshot,
+                build_result: Ok(()),
+                raise_result: Ok(()),
+                lower_result: Ok(()),
+                install_result: Ok(()),
+            }
+        }
+
+        fn failing_to_build(snapshot: TunnelSnapshot, err: &str) -> Self {
+            Self {
+                build_result: Err(err.to_string()),
+                ..Self::new(snapshot)
+            }
+        }
+    }
+
+    impl Tunnel for FakeTunnel {
+        fn snapshot(&self, _office_subnets: &[Ipv4Net], _profile_name: &str) -> TunnelSnapshot {
+            self.snapshot.clone()
+        }
+        fn build_profile(
+            &self,
+            _profile_name: &str,
+            _office_subnets: &[Ipv4Net],
+        ) -> Result<(), String> {
+            self.build_result.clone()
+        }
+        fn raise(&self, _profile_name: &str) -> Result<(), String> {
+            self.raise_result.clone()
+        }
+        fn lower(&self, _profile_name: &str) -> Result<(), String> {
+            self.lower_result.clone()
+        }
+        fn install_service(&self) -> Result<(), String> {
+            self.install_result.clone()
+        }
+    }
+
+    fn down_installed_snapshot() -> TunnelSnapshot {
+        TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            our_tunnel_up: false,
+            foreign_tunnel_up: false,
+            routes_error: None,
+        }
+    }
+
+    fn state_with_tunnel(
+        app: AppState,
+        cfg: Config,
+        tunnel: FakeTunnel,
+    ) -> (SettingsState, mpsc::Receiver<Cmd>) {
+        let (tx, rx) = mpsc::channel(4);
+        (
+            SettingsState {
+                app: Arc::new(ArcSwap::from_pointee(app)),
+                config: Arc::new(ArcSwap::from_pointee(cfg)),
+                commands: tx,
+                bound_port: 3129,
+                autostart: Arc::new(AutostartPending),
+                tunnel: Arc::new(tunnel),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn tunnel_section_explains_when_openvpn_is_not_installed() {
+        // Приёмка: раздел неактивен с внятным объяснением, а не просто серый.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(TunnelSnapshot::default()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("OpenVPN не найден"), "получили: {html}");
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"build_tunnel_profile\""));
+        assert!(!html.contains("value=\"install_service\""));
+    }
+
+    #[test]
+    fn tunnel_section_shows_a_down_tunnel_with_a_raise_button() {
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("Туннель опущен"), "получили: {html}");
+        assert!(html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn tunnel_section_hides_the_raise_button_until_a_profile_is_built() {
+        let snap = TunnelSnapshot {
+            profile_installed: false,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(
+            html.contains("Сначала соберите профиль"),
+            "получили: {html}"
+        );
+    }
+
+    #[test]
+    fn tunnel_section_shows_our_tunnel_up_with_a_lower_button() {
+        let snap = TunnelSnapshot {
+            our_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("Туннель поднят"), "получили: {html}");
+        assert!(html.contains("value=\"lower_tunnel\""));
+        assert!(!html.contains("value=\"raise_tunnel\""));
+    }
+
+    #[test]
+    fn tunnel_section_refuses_to_offer_raising_over_a_foreign_tunnel() {
+        // Приёмка: если поднят чужой туннель в наши сети — показать это и
+        // не предлагать подъём (задача 3, задача 7).
+        let snap = TunnelSnapshot {
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("ЧУЖОЙ туннель"), "получили: {html}");
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn the_dns_caveat_is_shown_before_the_tunnel_is_ever_raised() {
+        // Приёмка: пользователь узнаёт об этом до подъёма, а не догадывается.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        let dns_pos = html
+            .find("DNS-запрос")
+            .expect("предупреждение про DNS обязано быть на странице");
+        let raise_pos = html
+            .find("value=\"raise_tunnel\"")
+            .expect("кнопка подъёма обязана быть на странице");
+        assert!(
+            dns_pos < raise_pos,
+            "предупреждение про DNS обязано стоять до кнопки подъёма"
+        );
+    }
+
+    #[test]
+    fn a_uac_warning_appears_before_both_privileged_buttons() {
+        // Приёмка: явное предупреждение про UAC у обеих кнопок, ДО нажатия.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        let build_pos = html
+            .find("value=\"build_tunnel_profile\"")
+            .expect("кнопка сборки обязана быть на странице");
+        let install_pos = html
+            .find("value=\"install_service\"")
+            .expect("кнопка установки службы обязана быть на странице");
+        let uac_pos = html
+            .find("UAC")
+            .expect("предупреждение про UAC обязано быть на странице");
+        assert!(
+            uac_pos < build_pos && uac_pos < install_pos,
+            "предупреждение обязано стоять до обеих кнопок"
+        );
+    }
+
+    #[test]
+    fn the_routes_error_disables_both_tunnel_buttons_and_is_escaped() {
+        let snap = TunnelSnapshot {
+            routes_error: Some("<script>bad</script>".to_string()),
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(
+            !html.contains("<script>bad"),
+            "неэкранированный скрипт в разметке"
+        );
+        assert!(html.contains("&lt;script&gt;"), "экранированного вида нет");
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn office_subnets_are_listed_and_escaped() {
+        let cfg = Config {
+            office_subnets: vec!["203.0.113.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            cfg,
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("203.0.113.0/24"), "получили: {html}");
+    }
+
+    #[test]
+    fn the_automate_tunnel_toggle_is_off_by_default() {
+        // Приёмка: тумблер автоматики по умолчанию выключен (спека 8.5).
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(
+            html.contains("name=\"automate_tunnel\""),
+            "получили: {html}"
+        );
+        assert!(!html.contains("name=\"automate_tunnel\" checked"));
+    }
+
+    #[test]
+    fn the_automate_tunnel_toggle_can_be_turned_on_and_saved() {
+        let cfg = Config {
+            automate_tunnel: true,
+            ..Default::default()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            cfg,
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(
+            html.contains("name=\"automate_tunnel\" checked"),
+            "получили: {html}"
+        );
+    }
+
+    #[test]
+    fn automate_tunnel_survives_config_from_form() {
+        let next = config_from_form(
+            &base(),
+            &form(&format!("{}&automate_tunnel=on", unchanged_body(3129))),
+        )
+        .unwrap();
+        assert!(next.automate_tunnel);
+    }
+
+    #[tokio::test]
+    async fn a_failed_profile_build_is_shown_not_swallowed() {
+        // Приёмка: ошибка build_profile доходит до пользователя, не
+        // проглатывается.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::failing_to_build(
+                down_installed_snapshot(),
+                "незакрытый inline-блок «<ca>» (строка 2)",
+            ),
+        );
+        let html = handle_post(&state, b"action=build_tunnel_profile").await;
+        assert!(
+            html.contains("незакрытый inline-блок"),
+            "ошибка build_profile обязана быть показана дословно: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_is_refused_server_side_when_a_foreign_tunnel_is_up() {
+        // Защита не только на уровне разметки (кнопки нет), но и на уровне
+        // обработчика: прямой POST в обход кнопки тоже обязан быть отвергнут.
+        let snap = TunnelSnapshot {
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(
+            html.contains("ЧУЖОЙ туннель") || html.contains("чужой туннель"),
+            "получили: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_succeeds_and_reports_so() {
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(!html.contains("class=\"note bad\""), "получили: {html}");
     }
 }
