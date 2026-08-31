@@ -12,10 +12,40 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Net {
     pub addr: Ipv4Addr,
     pub prefix: u8,
+}
+
+/// Сериализуется той же строкой, что и `Display` («10.0.0.0/8»), а не
+/// таблицей `{ addr, prefix }` — производный `#[derive(Serialize)]` дал бы
+/// именно вложенную таблицу, а конфиг (задача 5) обязан хранить подсеть
+/// одной строкой, той же, что печатает страница настроек и что понимает
+/// `FromStr`.
+impl Serialize for Ipv4Net {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+/// Обратная сторона `Serialize` выше — тем же `FromStr`, что и разбор из
+/// текста, поэтому маскировка хостовых битов и вся строгость формата
+/// (без `+8`, без `/08`) действуют одинаково что при чтении конфига, что
+/// при разборе значения, введённого руками.
+impl<'de> Deserialize<'de> for Ipv4Net {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Маска сети, посчитанная из длины префикса — арифметикой, а не таблицей
@@ -161,6 +191,41 @@ mod tests {
         assert_eq!(net.addr, Ipv4Addr::new(10, 0, 0, 0));
         assert_eq!(net.prefix, 8);
         assert_eq!(net.to_string(), "10.0.0.0/8");
+    }
+
+    /// Обёртка нужна только затем, что `toml::to_string` не сериализует
+    /// голое значение верхнего уровня — самой `Ipv4Net` это не касается.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Wrapper {
+        net: Ipv4Net,
+    }
+
+    #[test]
+    fn serde_uses_the_same_compact_string_as_display() {
+        // Задача 5 хранит подсети в TOML-конфиге этой же строкой — не
+        // вложенной таблицей `{ addr, prefix }`, которую дал бы производный
+        // `#[derive(Serialize)]`.
+        let w = Wrapper {
+            net: Ipv4Net::from_str("203.0.113.0/24").expect("должен разобраться"),
+        };
+        let text = toml::to_string(&w).expect("должен сериализоваться");
+        assert_eq!(text.trim(), "net = \"203.0.113.0/24\"");
+    }
+
+    #[test]
+    fn serde_roundtrips_through_toml() {
+        let original = Wrapper {
+            net: Ipv4Net::from_str("198.51.100.0/24").expect("должен разобраться"),
+        };
+        let text = toml::to_string(&original).expect("должен сериализоваться");
+        let back: Wrapper = toml::from_str(&text).expect("должен разобраться");
+        assert_eq!(back.net, original.net);
+    }
+
+    #[test]
+    fn serde_rejects_an_invalid_subnet_string() {
+        let bad = "net = \"not-a-subnet\"";
+        assert!(toml::from_str::<Wrapper>(bad).is_err());
     }
 
     #[test]

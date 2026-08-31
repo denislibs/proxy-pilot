@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::mode::{ConnectedNetwork, Mode, Place, Upstreams};
+use crate::net::Ipv4Net;
+use crate::netprofile::NetProfile;
 
 pub const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,.local,\
 169.254.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12";
@@ -42,6 +44,25 @@ pub struct Config {
     /// остаётся без зависимостей от Windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_sysproxy: Option<SavedSysProxy>,
+    /// Офисные подсети для маршрутов туннеля (`route` в собранном
+    /// split-tunnel профиле, `winnet::ovpn_profile::build_profile`).
+    ///
+    /// **Это не то же самое, что `office_networks` выше.** `office_networks`
+    /// хранит GUID сетей NLM — по ним опознаётся, где мы физически находимся
+    /// («мы в офисе»), и маршрут из GUID вывести нельзя. `office_subnets` —
+    /// это CIDR-подсети самого офиса, данные другой природы с похожим
+    /// именем; не путать одно с другим при правках.
+    #[serde(default)]
+    pub office_subnets: Vec<Ipv4Net>,
+    /// Офисный статический профиль сети адаптера (`netprofile::decide_profile`,
+    /// задача 5) — адрес, маска, шлюз, DNS, которые применяются в офисе.
+    #[serde(default)]
+    pub net_profile: NetProfile,
+    /// Тумблер автоматики туннеля (спека 8.5): при включении туннель сам
+    /// поднимается вне офиса и опускается в офисе. Выключен по умолчанию —
+    /// туннель поднимается руками, пока человек явно не включит автоматику.
+    #[serde(default)]
+    pub automate_tunnel: bool,
 }
 
 /// Снимок системных настроек прокси для конфига.
@@ -77,6 +98,9 @@ impl Default for Config {
             manage_system_proxy: true,
             office_networks: Vec::new(),
             saved_sysproxy: None,
+            office_subnets: Vec::new(),
+            net_profile: NetProfile::default(),
+            automate_tunnel: false,
         }
     }
 }
@@ -567,6 +591,62 @@ mod tests {
         let p =
             Config::default().place_for(&[net("{AAAA0000-0000-0000-0000-000000000001}", "Офис")]);
         assert!(!p.in_office);
+    }
+
+    #[test]
+    fn a_config_without_the_net_profile_fields_still_loads() {
+        // Конфиг из версии до задачи 5 не содержит office_subnets, net_profile
+        // и тумблер автоматики туннеля вовсе — недостающее обязано читаться
+        // как дефолт, а не как ошибка разбора.
+        let c = Config::from_toml("bridge_port = 3131").expect("должен разобраться");
+        assert_eq!(c.bridge_port, 3131);
+        assert!(c.office_subnets.is_empty());
+        assert_eq!(c.net_profile, crate::netprofile::NetProfile::default());
+        assert!(!c.automate_tunnel);
+    }
+
+    #[test]
+    fn office_subnets_and_office_networks_are_independent() {
+        // office_subnets (маршруты туннеля) и office_networks (GUID сетей NLM
+        // для опознания места) — два разных набора данных с похожими именами;
+        // правка одного не обязана трогать другой.
+        let c = Config {
+            office_subnets: vec!["203.0.113.0/24".parse().expect("должен разобраться")],
+            ..Default::default()
+        };
+        assert!(c.office_networks.is_empty());
+        assert_eq!(c.office_subnets.len(), 1);
+    }
+
+    #[test]
+    fn net_profile_and_office_subnets_survive_a_toml_roundtrip() {
+        use crate::netprofile::NetProfile;
+        use std::net::Ipv4Addr;
+
+        let c = Config {
+            office_subnets: vec![
+                "203.0.113.0/24".parse().expect("должен разобраться"),
+                "198.51.100.0/24".parse().expect("должен разобраться"),
+            ],
+            net_profile: NetProfile {
+                office_ip: Some(Ipv4Addr::new(203, 0, 113, 10)),
+                office_mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+                office_gateway: Some(Ipv4Addr::new(203, 0, 113, 1)),
+                office_dns: vec![Ipv4Addr::new(203, 0, 113, 53)],
+            },
+            automate_tunnel: true,
+            ..Default::default()
+        };
+        let parsed = Config::from_toml(&c.to_toml()).expect("должен разобраться");
+        assert_eq!(parsed.office_subnets, c.office_subnets);
+        assert_eq!(parsed.net_profile, c.net_profile);
+        assert_eq!(parsed.automate_tunnel, c.automate_tunnel);
+    }
+
+    #[test]
+    fn automate_tunnel_is_off_by_default() {
+        // Спека 8.5: по умолчанию туннель поднимается руками.
+        assert!(!Config::default().automate_tunnel);
     }
 
     #[test]

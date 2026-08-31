@@ -407,7 +407,7 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
                     Cmd::SetMode(mode) => Some(Change::Mode(mode)),
                     Cmd::ApplyConfig { config, done } => {
                         reply = Some(done);
-                        Some(Change::Whole(*config))
+                        Some(Change::Whole(config))
                     }
                 };
                 if let Some(change) = change {
@@ -521,7 +521,13 @@ enum Change {
     /// Переключение режима из трея — одно поле.
     Mode(Mode),
     /// Форма страницы настроек прислала конфиг целиком.
-    Whole(Config),
+    ///
+    /// `Box`, тем же приёмом, что и `Cmd::ApplyConfig` рядом: задача 5
+    /// добавила в `Config` `office_subnets`, `net_profile` и тумблер
+    /// автоматики туннеля, и вариант без коробки стал заметно крупнее
+    /// `Mode` — тот самый `large_enum_variant`, который здесь уже когда-то
+    /// решили боксом, а не `#[allow(...)]` (запрещён CLAUDE.md).
+    Whole(Box<Config>),
 }
 
 /// Применяет изменение к сохранённому конфигу и отдаёт ЖИВОЙ — тот, с
@@ -549,7 +555,7 @@ enum Change {
 fn apply_change(saved: &mut Config, change: Change, bound_port: u16) -> Config {
     match change {
         Change::Mode(mode) => saved.mode = mode,
-        Change::Whole(next) => *saved = next,
+        Change::Whole(next) => *saved = *next,
     }
     settings_page::live_config(saved, bound_port)
 }
@@ -942,10 +948,10 @@ mod tests {
         };
         let live = apply_change(
             &mut saved,
-            Change::Whole(Config {
+            Change::Whole(Box::new(Config {
                 bridge_port: REQUESTED,
                 ..Config::default()
-            }),
+            })),
             BOUND,
         );
         assert_eq!(
@@ -968,7 +974,7 @@ mod tests {
         };
         let live = apply_change(
             &mut saved,
-            Change::Whole(Config {
+            Change::Whole(Box::new(Config {
                 bridge_port: REQUESTED,
                 socks_upstream: Some("203.0.113.10:9999".into()),
                 office_networks: vec![OfficeNetwork {
@@ -976,7 +982,7 @@ mod tests {
                     name: "Офис".into(),
                 }],
                 ..Config::default()
-            }),
+            })),
             BOUND,
         );
         assert_eq!(live.socks_upstream.as_deref(), Some("203.0.113.10:9999"));
