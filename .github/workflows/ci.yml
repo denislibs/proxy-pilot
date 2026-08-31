@@ -24,8 +24,26 @@ jobs:
         run: cargo fmt --all --check
       - name: Клиппи
         run: cargo clippy --all-targets -- -D warnings
+      # Не просто `cargo test`: при отказе имена упавших тестов выводятся
+      # через `::error::`, и тогда они попадают в аннотации прогона. Аннотации
+      # читаются через API без авторизации, а логи Actions — нет, даже у
+      # публичного репозитория. Без этого единственное, что видно снаружи, —
+      # «process completed with exit code 1», по которому диагноза не
+      # поставить. Мы это уже проходили: девять красных прогонов подряд, и ни
+      # одного имени теста.
       - name: Тесты
-        run: cargo test --all
+        shell: pwsh
+        run: |
+          $out = cargo test --all 2>&1 | Tee-Object -Variable captured
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $failed = $captured | Select-String -Pattern '^test .+ \.\.\. FAILED$'
+            $panics = $captured | Select-String -Pattern 'panicked at'
+            $detail = (@($failed) + @($panics) | ForEach-Object { $_.ToString().Trim() }) -join ' | '
+            if (-not $detail) { $detail = 'ни одного имени теста в выводе — смотрите полный лог' }
+            Write-Output "::error title=Упавшие тесты::$detail"
+          }
+          exit $code
 
       - name: Сборка релиза
         run: cargo build --release -p proxypilot-bridge -p proxypilot-app
