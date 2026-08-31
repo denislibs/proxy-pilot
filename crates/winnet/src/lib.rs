@@ -12,6 +12,7 @@ pub mod openvpn;
 pub mod ovpn_profile;
 pub mod routes;
 pub mod sysproxy;
+pub mod tunnel_log;
 pub mod tunnel_state;
 
 #[derive(Debug, thiserror::Error)]
@@ -56,4 +57,14 @@ pub enum WinNetError {
     /// вызывающий `build_profile`).
     #[error("не удалось собрать профиль: {0}")]
     Profile(#[from] crate::ovpn_profile::ProfileError),
+    /// Лог `openvpn-gui.exe` для нашего профиля (`tunnel_log::liveness`)
+    /// существует, но прочитать его не удалось — например, файл занят
+    /// другим процессом или права доступа не позволяют читать. Отсутствие
+    /// самого файла — не эта ошибка, а честный
+    /// `tunnel_log::TunnelLiveness::NeverConnected`.
+    #[error("не удалось прочитать лог туннеля {path:?}: {source}")]
+    TunnelLogRead {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }

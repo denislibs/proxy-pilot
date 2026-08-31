@@ -165,18 +165,28 @@ pub fn network_text(state: &AppState) -> String {
 /// разбирает раздел «Туннель» на странице настроек: пункт меню это одна
 /// строка, места на предупреждения (про DNS, про UAC, про чужой туннель) в
 /// ней нет — за подробностями пункт `Action::OpenTunnel` ведёт туда же.
+/// Тот же приоритет, что и `settings_page::tunnel_section` (fix round 1,
+/// задача 7): `our_tunnel_up` (лог OpenVPN GUI, ключ — имя профиля)
+/// проверяется раньше `foreign_tunnel_up` (таблица маршрутов + алиас
+/// адаптера) — иначе свой же поднятый туннель, ошибочно прочитанный по
+/// алиасу как чужой, показывал бы в меню «обнаружен чужой» вместо
+/// «поднят», и разошёлся бы со страницей настроек, которая уже покажет
+/// кнопку «опустить».
 pub fn tunnel_text(snap: &TunnelSnapshot) -> String {
     if !snap.installed {
         return "Туннель: OpenVPN не установлен".to_string();
     }
-    if snap.routes_error.is_some() {
+    if snap.liveness_error.is_some() {
         return "Туннель: состояние неизвестно".to_string();
-    }
-    if snap.foreign_tunnel_up {
-        return "Туннель: обнаружен чужой".to_string();
     }
     if snap.our_tunnel_up {
         return "Туннель: поднят".to_string();
+    }
+    if snap.routes_error.is_some() {
+        return "Туннель: опущен · маршруты не проверены".to_string();
+    }
+    if snap.foreign_tunnel_up {
+        return "Туннель: опущен · маршруты заняты другим адаптером".to_string();
     }
     if snap.profile_installed {
         "Туннель: опущен".to_string()
@@ -774,27 +784,58 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_text_warns_about_a_foreign_tunnel() {
+    fn tunnel_text_warns_about_routes_being_occupied() {
         let snap = TunnelSnapshot {
             installed: true,
             foreign_tunnel_up: true,
             ..Default::default()
         };
         let t = tunnel_text(&snap);
-        assert!(t.contains("чужой"), "получили: {t}");
+        assert!(t.contains("заняты"), "получили: {t}");
     }
 
     #[test]
-    fn tunnel_text_reports_an_unreadable_route_table_honestly() {
+    fn tunnel_text_reports_an_unknown_liveness_honestly() {
         // Не выдаёт «поднят»/«опущен» увереннее, чем знает: не сумели
-        // прочитать таблицу маршрутов — состояние неизвестно, а не «опущен»
-        // по умолчанию.
+        // прочитать лог OpenVPN GUI — состояние неизвестно, а не «опущен»
+        // по умолчанию (тот самый дедлок, который эта же честность и
+        // устраняет — молчаливое «опущен» скрыло бы кнопку «опустить»,
+        // если туннель на самом деле поднят).
         let snap = TunnelSnapshot {
             installed: true,
-            routes_error: Some("тестовый отказ".to_string()),
+            liveness_error: Some("тестовый отказ".to_string()),
             ..Default::default()
         };
         let t = tunnel_text(&snap);
         assert!(t.contains("неизвестно"), "получили: {t}");
+    }
+
+    #[test]
+    fn tunnel_text_does_not_hide_an_unreadable_route_table_as_plain_down() {
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            routes_error: Some("тестовый отказ".to_string()),
+            ..Default::default()
+        };
+        let t = tunnel_text(&snap);
+        assert!(t.contains("не проверены"), "получили: {t}");
+    }
+
+    #[test]
+    fn tunnel_text_prefers_confirmed_liveness_over_a_misclassified_foreign_reading() {
+        // Регрессия на fix round 1: `our_tunnel_up` (лог, ключ — имя
+        // профиля) обязана перевешивать `foreign_tunnel_up` (таблица
+        // маршрутов + ненадёжный алиас адаптера) — иначе меню трея и
+        // страница настроек разошлись бы в самый важный момент: страница
+        // уже покажет кнопку «опустить», а трей — «обнаружен чужой».
+        let snap = TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            our_tunnel_up: true,
+            foreign_tunnel_up: true,
+            ..Default::default()
+        };
+        assert_eq!(tunnel_text(&snap), "Туннель: поднят");
     }
 }

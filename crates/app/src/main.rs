@@ -70,7 +70,7 @@ use proxypilot_winnet::com::ComGuard;
 use proxypilot_winnet::events::{debounce, watch_network_changes};
 use proxypilot_winnet::networks::list_connected;
 use proxypilot_winnet::openvpn::{self, ProfileStatus};
-use proxypilot_winnet::{routes as ip_routes, tunnel_state};
+use proxypilot_winnet::{routes as ip_routes, tunnel_log, tunnel_state};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -825,25 +825,39 @@ impl settings_page::Tunnel for WinTunnel {
             openvpn::profile_status(&inst, profile_name),
             Ok(ProfileStatus::Installed)
         );
-        match Self::adapters() {
-            Ok(adapters) => settings_page::TunnelSnapshot {
-                installed: true,
-                profile_installed,
-                our_tunnel_up: tunnel_state::our_tunnel_up(&adapters, profile_name),
-                foreign_tunnel_up: tunnel_state::foreign_tunnel_up(
-                    office_subnets,
-                    &adapters,
-                    profile_name,
-                ),
-                routes_error: None,
-            },
-            Err(e) => settings_page::TunnelSnapshot {
-                installed: true,
-                profile_installed,
-                our_tunnel_up: false,
-                foreign_tunnel_up: false,
-                routes_error: Some(e),
-            },
+
+        // Живость — по логу openvpn-gui.exe для нашего профиля
+        // (`tunnel_log::liveness`), НЕ по имени адаптера: fix round 1
+        // задачи 7 нашёл, что реальные адаптеры называются по драйверу
+        // («OpenVPN Wintun», «TAP-Windows Adapter V9»), никогда — по имени
+        // соединения, и алиас-based `our_tunnel_up` возвращала `false`
+        // навсегда (докблок `settings_page::TUNNEL_PROFILE_NAME`,
+        // `winnet::tunnel_log`).
+        let (our_tunnel_up, liveness_error) = match tunnel_log::liveness(profile_name) {
+            Ok(live) => (live == tunnel_log::TunnelLiveness::Up, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        // Таблица маршрутов + алиас адаптера остаются в деле только для
+        // `foreign_tunnel_up` — предупредить ДО подъёма, что офисные
+        // подсети уже кем-то заняты. Независимый источник, независимая
+        // ошибка: отказ прочитать маршруты не должен гасить то, что мы уже
+        // честно знаем о своей живости из лога, и наоборот.
+        let (foreign_tunnel_up, routes_error) = match Self::adapters() {
+            Ok(adapters) => (
+                tunnel_state::foreign_tunnel_up(office_subnets, &adapters, profile_name),
+                None,
+            ),
+            Err(e) => (false, Some(e)),
+        };
+
+        settings_page::TunnelSnapshot {
+            installed: true,
+            profile_installed,
+            our_tunnel_up,
+            liveness_error,
+            foreign_tunnel_up,
+            routes_error,
         }
     }
 
