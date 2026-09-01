@@ -704,6 +704,7 @@ mod tests {
                 bound_port,
                 autostart: Arc::new(AutostartPending),
                 tunnel: Arc::new(TunnelPending),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
             }),
             applied,
         )

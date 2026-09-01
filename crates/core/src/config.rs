@@ -69,6 +69,19 @@ pub struct Config {
     /// туннель поднимается руками, пока человек явно не включит автоматику.
     #[serde(default)]
     pub automate_tunnel: bool,
+    /// Тумблер фоновой проверки обновлений (план 5, задача 3). Выключает
+    /// только сам сетевой ОПРОС релизов — не проверку подписи уже
+    /// скачанного файла: у последней нет и не может быть выключателя (см.
+    /// докблок `crates/app/src/update/verify.rs`). Включён по умолчанию:
+    /// проверка не блокирует старт и не мешает работе (`docs/process/win-delivery/task-3-brief.md`),
+    /// так что выключать её по умолчанию нет причины — только по явному
+    /// желанию человека.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
+}
+
+fn default_check_for_updates() -> bool {
+    true
 }
 
 /// Снимок системных настроек прокси для конфига.
@@ -107,6 +120,7 @@ impl Default for Config {
             office_subnets: Vec::new(),
             net_profile: NetProfile::default(),
             automate_tunnel: false,
+            check_for_updates: true,
         }
     }
 }
@@ -641,18 +655,43 @@ mod tests {
                 office_dns: vec![Ipv4Addr::new(203, 0, 113, 53)],
             },
             automate_tunnel: true,
+            check_for_updates: false,
             ..Default::default()
         };
         let parsed = Config::from_toml(&c.to_toml()).expect("должен разобраться");
         assert_eq!(parsed.office_subnets, c.office_subnets);
         assert_eq!(parsed.net_profile, c.net_profile);
         assert_eq!(parsed.automate_tunnel, c.automate_tunnel);
+        assert_eq!(parsed.check_for_updates, c.check_for_updates);
     }
 
     #[test]
     fn automate_tunnel_is_off_by_default() {
         // Спека 8.5: по умолчанию туннель поднимается руками.
         assert!(!Config::default().automate_tunnel);
+    }
+
+    #[test]
+    fn checking_for_updates_is_on_by_default_and_switchable() {
+        // Задача 3: проверка не блокирует старт и не мешает работе, поэтому
+        // включена по умолчанию — в отличие от `automate_tunnel` выше,
+        // которую задача 5 намеренно оставила выключенной как более
+        // заметное вмешательство в сеть машины.
+        assert!(Config::default().check_for_updates);
+        let c = Config::from_toml("check_for_updates = false").expect("должен разобраться");
+        assert!(!c.check_for_updates);
+    }
+
+    #[test]
+    fn a_config_without_the_update_toggle_still_loads_and_defaults_to_on() {
+        // Конфиг из версии до задачи 3 не содержит check_for_updates вовсе —
+        // недостающее обязано читаться как «включено», а не как ошибка
+        // разбора и не как «выключено» (два разных смысла отсутствия поля,
+        // и молчаливая подстановка неверного была бы тихой сменой
+        // поведения при обновлении с версии до этой задачи).
+        let c = Config::from_toml("bridge_port = 3131").expect("должен разобраться");
+        assert_eq!(c.bridge_port, 3131);
+        assert!(c.check_for_updates);
     }
 
     #[test]

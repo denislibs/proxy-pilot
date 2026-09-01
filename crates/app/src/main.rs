@@ -49,6 +49,7 @@ mod proxy;
 mod settings_page;
 mod tray;
 mod ui;
+mod update;
 mod websrv;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,6 +130,20 @@ const PROBE_TTL: Duration = Duration::from_secs(30);
 /// кэш, то есть половина пересчётов не проверяла бы ничего и лишь жгла
 /// вызовы NLM. При 60 с каждый тик — свежая проба обоих апстримов.
 const REEVALUATE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Как часто фоновая проверка спрашивает GitHub про новый релиз. Не на
+/// каждом старте и не каждую минуту: анонимные запросы к API ограничены по
+/// числу в час, а релизы происходят не каждый день — раз в сутки более чем
+/// достаточно для «неблокирующего фонового уведомления», которым эта
+/// проверка и является (задача 3).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Задержка первой проверки после старта. Не сразу: старт и так занят более
+/// срочными вещами (первый пересчёт маршрута, привязка слушателя,
+/// самопроверка), а сеть на проверку обновлений может быть недоступна ровно
+/// в момент старта — приёмка задачи 3 требует, чтобы это не задерживало и
+/// не портило впечатление о старте вовсе.
+const UPDATE_CHECK_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Что делать супервизору. Смена сети, смена режима и правка настроек
 /// сходятся в один канал: все три означают «пересчитай», и обрабатывать их
@@ -304,6 +319,38 @@ fn run() -> Result<(), String> {
     // него, в файл не попадёт. Страж обязан дожить до конца `run`.
     let _log_guard = log::init(Some(&log_dir));
 
+    // Обновление, отложенное фоновой проверкой ПРОШЛОГО запуска
+    // (`update::check`), ставится на место здесь — ДО `Config::load`, ДО
+    // COM, ДО привязки слушателя моста. Это и есть «замена при следующем
+    // запуске, а не под работающим процессом» (`CLAUDE.md`,
+    // `docs/process/win-delivery/task-3-brief.md`): этот процесс ещё
+    // ничего не взял на себя — ни порт, ни системный прокси, — и если
+    // своп произошёл, он тут же перезапускает себя же и завершается, так
+    // и не тронув реестр. Подробности — докблок `update::install`.
+    if let Ok(exe) = std::env::current_exe() {
+        let update_dir = dir.join("update");
+        match update::install::apply_pending_update(
+            &update_dir,
+            &exe,
+            update::install::real_verifier,
+        ) {
+            Ok(true) => {
+                info!("отложенное обновление применено — перезапускаемся");
+                match update::install::relaunch(&exe) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => error!(
+                        error = %e,
+                        "не удалось перезапуститься после обновления — продолжаем со старой копией в памяти"
+                    ),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "отложенное обновление не применилось"),
+        }
+    } else {
+        warn!("не узнать свой путь — проверка отложенного обновления пропущена");
+    }
+
     let outcome = run_logged(&config_path);
     if let Err(e) = &outcome {
         error!(error = %e, "запуск не удался");
@@ -462,6 +509,23 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
     spawn_network_watch(&runtime, commands.clone());
     spawn_periodic_reevaluate(&runtime, commands.clone());
 
+    // Итог последней фоновой проверки обновлений — читает страница настроек
+    // (`update_status_note`), пишет только задача, запущенная ниже.
+    // `None` — «ещё не проверялось», отдельно от «проверили и отказало»
+    // (см. докблок `settings_page::SettingsState::update_status`).
+    let update_status: Arc<ArcSwap<Option<update::check::CheckOutcome>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    if let Some(update_dir) = config_path.parent().map(|d| d.join("update")) {
+        spawn_update_check(
+            &runtime,
+            Arc::clone(&saved_config),
+            update_dir,
+            Arc::clone(&update_status),
+        );
+    } else {
+        warn!("нет каталога конфигурации — фоновая проверка обновлений не запущена");
+    }
+
     {
         let state = Arc::clone(&state);
         let saved_config = Arc::clone(&saved_config);
@@ -525,15 +589,20 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
         });
     }
 
-    match message_loop(
-        &tray,
-        &state,
-        &saved_config,
-        &commands,
-        &runtime,
-        port,
-        &tunnel,
-    ) {
+    // Собран здесь же, а не внутри `message_loop`: восьмым параметром
+    // (`update_status`, задача 3) собственный список аргументов функции
+    // перевалил бы за предел `clippy::too_many_arguments` (7) второй раз —
+    // тем же приёмом, каким уже собран `SettingsDeps` для `open_settings`.
+    let settings_deps = SettingsDeps {
+        runtime: &runtime,
+        state: &state,
+        saved_config: &saved_config,
+        commands: &commands,
+        bound_port: port,
+        tunnel: &tunnel,
+        update_status: &update_status,
+    };
+    match message_loop(&tray, &settings_deps) {
         Exit::User => {
             info!("выход по команде пользователя");
             Ok(())
@@ -720,6 +789,52 @@ fn spawn_periodic_reevaluate(runtime: &tokio::runtime::Runtime, commands: mpsc::
             if commands.send(Cmd::Reevaluate).await.is_err() {
                 return;
             }
+        }
+    });
+}
+
+/// Фоновая проверка обновлений (план 5, задача 3).
+///
+/// **Не блокирует старт**: заводится через `runtime.spawn`, а не
+/// `block_on`, и сама функция вызывается не отсюда напрямую, а из тела
+/// заведённой задачи — то есть первая проверка происходит не раньше, чем
+/// истечёт `UPDATE_CHECK_INITIAL_DELAY` уже ПОСЛЕ того, как привязан
+/// слушатель, поднят трей и запущена самопроверка. `update::check::run`
+/// сама оборачивает сетевую работу таймаутом, так что зависшая сеть роняет
+/// одну проверку, а не поток целиком.
+///
+/// Тумблер (`cfg.check_for_updates`) читается заново на каждом тике из
+/// `saved_config`, а не один раз при запуске задачи: человек мог выключить
+/// проверку уже после старта, и следующий же тик обязан это увидеть, а не
+/// продолжать спрашивать сеть по инерции.
+fn spawn_update_check(
+    runtime: &tokio::runtime::Runtime,
+    saved_config: Arc<ArcSwap<Config>>,
+    update_dir: std::path::PathBuf,
+    status: Arc<ArcSwap<Option<update::check::CheckOutcome>>>,
+) {
+    let source: Arc<dyn update::source::UpdateSource> =
+        Arc::new(update::source::GithubSource::default());
+    runtime.spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + UPDATE_CHECK_INITIAL_DELAY,
+            UPDATE_CHECK_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let enabled = saved_config.load().check_for_updates;
+            let outcome = update::check::run(
+                env!("CARGO_PKG_VERSION").to_string(),
+                enabled,
+                Arc::clone(&source),
+                update_dir.clone(),
+                update::install::real_verifier,
+                update::check::DEFAULT_TIMEOUT,
+            )
+            .await;
+            info!(?outcome, "проверка обновлений завершена");
+            status.store(Arc::new(Some(outcome)));
         }
     });
 }
@@ -979,6 +1094,10 @@ struct SettingsDeps<'a> {
     commands: &'a mpsc::Sender<Cmd>,
     bound_port: u16,
     tunnel: &'a Arc<dyn settings_page::Tunnel>,
+    /// Итог последней фоновой проверки обновлений (задача 3) — та же
+    /// ячейка, что пишет `spawn_update_check`, а не копия: странице и
+    /// заведённой задаче незачем расходиться в том, что показывать.
+    update_status: &'a Arc<ArcSwap<Option<update::check::CheckOutcome>>>,
 }
 
 /// Открывает страницу настроек: поднимает сервер, если его нет, и зовёт
@@ -1021,6 +1140,7 @@ fn open_settings(deps: &SettingsDeps, server: &mut Option<websrv::Server>, secti
             bound_port: deps.bound_port,
             autostart: Arc::new(WinAutostart),
             tunnel: Arc::clone(deps.tunnel),
+            update_status: Arc::clone(deps.update_status),
         });
         // `block_on` с главного потока безопасен: он не внутри рантайма, а
         // сама привязка слушателя занимает микросекунды — цикл сообщений
@@ -1066,27 +1186,11 @@ fn open_settings(deps: &SettingsDeps, server: &mut Option<websrv::Server>, secti
 
 /// Цикл сообщений главного потока. Без него не работает ни иконка, ни меню:
 /// оболочка общается с ними оконными сообщениями.
-fn message_loop(
-    tray: &Tray,
-    state: &Arc<ArcSwap<AppState>>,
-    saved_config: &Arc<ArcSwap<Config>>,
-    commands: &mpsc::Sender<Cmd>,
-    runtime: &tokio::runtime::Runtime,
-    bound_port: u16,
-    tunnel: &Arc<dyn settings_page::Tunnel>,
-) -> Exit {
+fn message_loop(tray: &Tray, deps: &SettingsDeps) -> Exit {
     let mut msg = MSG::default();
     // Сервер настроек живёт ровно столько, сколько живёт эта переменная:
     // выход из цикла — любой из четырёх — уничтожает её вместе с дверью.
     let mut settings: Option<websrv::Server> = None;
-    let deps = SettingsDeps {
-        runtime,
-        state,
-        saved_config,
-        commands,
-        bound_port,
-        tunnel,
-    };
     loop {
         // До блокирующего ожидания: мост мог умереть ещё до того, как мы
         // сюда дошли, и тогда ждать сообщений незачем.
@@ -1117,13 +1221,13 @@ fn message_loop(
             return Exit::BridgeStopped;
         }
         if msg.message == WM_STATE_CHANGED {
-            let snapshot = state.load();
+            let snapshot = deps.state.load();
             // Живой снимок туннеля — те же чтения (реестр, файловая
             // система, таблица маршрутов), что и на странице настроек, тут
             // же на главном потоке: все они быстрые локальные вызовы без
             // сети, тем же приёмом, что и `icon_for`/`network_text` рядом.
-            let tunnel_snapshot = tunnel.snapshot(
-                &saved_config.load().office_subnets,
+            let tunnel_snapshot = deps.tunnel.snapshot(
+                &deps.saved_config.load().office_subnets,
                 settings_page::TUNNEL_PROFILE_NAME,
             );
             tray.refresh(&snapshot, &tunnel_snapshot);
@@ -1148,16 +1252,16 @@ fn message_loop(
             match tray.action_for(event.id()) {
                 Some(Action::Quit) => return Exit::User,
                 Some(Action::CopyAddress) => tray.copy_address(),
-                Some(Action::OpenSettings) => open_settings(&deps, &mut settings, None),
-                Some(Action::OpenBench) => open_settings(&deps, &mut settings, Some("bench")),
-                Some(Action::OpenDoctor) => open_settings(&deps, &mut settings, Some("doctor")),
-                Some(Action::OpenTunnel) => open_settings(&deps, &mut settings, Some("tunnel")),
+                Some(Action::OpenSettings) => open_settings(deps, &mut settings, None),
+                Some(Action::OpenBench) => open_settings(deps, &mut settings, Some("bench")),
+                Some(Action::OpenDoctor) => open_settings(deps, &mut settings, Some("doctor")),
+                Some(Action::OpenTunnel) => open_settings(deps, &mut settings, Some("tunnel")),
                 Some(Action::SetMode(mode)) => {
                     // `try_send`, а не `blocking_send`: главный поток обязан
                     // вернуться в цикл сообщений — застрявший цикл выглядит
                     // как зависшая система, а очередь на 16 команд от кликов
                     // мышью переполниться не может.
-                    if let Err(e) = commands.try_send(Cmd::SetMode(mode)) {
+                    if let Err(e) = deps.commands.try_send(Cmd::SetMode(mode)) {
                         warn!(error = %e, ?mode, "команда смены режима не доставлена");
                     }
                 }

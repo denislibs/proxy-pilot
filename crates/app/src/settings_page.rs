@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::doctor::{self, Check, CheckStatus};
+use crate::update::check::CheckOutcome;
 use crate::Cmd;
 
 /// Что качаем при замере и сколько.
@@ -352,6 +353,13 @@ pub struct SettingsState {
     pub autostart: Arc<dyn Autostart>,
     /// OpenVPN-туннель и установка службы статического IP (задача 7).
     pub tunnel: Arc<dyn Tunnel>,
+    /// Итог последней фоновой проверки обновлений (`update::check::run`,
+    /// вызывается из `main.rs`). `None` — проверка ещё ни разу не
+    /// завершилась (тумблер мог быть выключен всё это время, или процесс
+    /// только что стартовал и первая проверка ещё не дошла до тика) —
+    /// страница обязана отличать это от `Failed`: «ещё не проверяли» не то
+    /// же самое, что «проверили и не получилось».
+    pub update_status: Arc<ArcSwap<Option<CheckOutcome>>>,
 }
 
 /// Что показать над формой после действия.
@@ -555,6 +563,10 @@ pub fn config_from_form(base: &Config, form: &Form) -> Result<Config, String> {
         http_upstream: optional(form.get("http_upstream")),
         no_proxy: normalise_bypass(form.get("no_proxy").unwrap_or_default()),
         manage_system_proxy: form.checked("manage_system_proxy"),
+        // Задача 3: выключает только сетевой опрос релизов, не проверку
+        // подписи уже скачанного файла — той негде быть выключателем в
+        // конфиге вовсе (докблок `update::verify`).
+        check_for_updates: form.checked("check_for_updates"),
         office_networks,
         // Спека 8.5: по умолчанию выключено — форма не присылает поле
         // вовсе, пока человек его не отметил (`Form::checked`), и тогда
@@ -754,6 +766,22 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         !autostart_note.is_empty(),
         &autostart_note,
     ));
+    b.push_str("</section>\n");
+
+    b.push_str("<section class=\"card\" aria-labelledby=\"updates\">\n");
+    b.push_str("<h2 id=\"updates\">Обновления</h2>\n");
+    b.push_str(&checkbox(
+        "check_for_updates",
+        "Проверять обновления",
+        cfg.check_for_updates,
+        false,
+        "Проверка идёт в фоне раз в сутки и никогда не задерживает запуск \
+         или работу моста. Скачанный файл проверяется подписью \
+         Authenticode перед заменой; без подтверждённой подписи \
+         обновление не устанавливается — эта проверка тумблером не \
+         управляется и не выключается никогда.",
+    ));
+    b.push_str(&update_status_note(&state.update_status.load()));
     b.push_str("</section>\n");
 
     b.push_str("<div class=\"actions\">");
@@ -1219,6 +1247,66 @@ fn health_chip(addr: Option<&str>, health: Reachability) -> String {
         "<span class=\"chip {}\">{}</span>",
         health_class(addr, health),
         escape_html(&health_text(addr, health))
+    )
+}
+
+/// Итог последней проверки обновлений человеческим текстом. Отдельная
+/// чистая функция от разметки ([`update_status_note`]) ради теста: приёмка
+/// задачи 3 прямо требует, что отказ сети НЕ показывается как «вы в курсе
+/// последней версии» — здесь это проверяется без HTTP-сервера и токенов.
+///
+/// `bool` в возврате — «эта строка плохая новость» (класс `.note.bad`, тот
+/// же словарь, что и у [`Outcome::bad`]): не по одному только цвету (см.
+/// докблок [`STYLE`]), но текст всё равно должен идти со своим классом.
+fn update_status_text(status: &Option<CheckOutcome>) -> (bool, String) {
+    match status {
+        None => (
+            false,
+            "ещё не проверялось — первая проверка идёт в фоне после старта".to_string(),
+        ),
+        Some(CheckOutcome::Disabled) => (false, "проверка выключена".to_string()),
+        Some(CheckOutcome::UpToDate) => (false, "установлена последняя версия".to_string()),
+        Some(CheckOutcome::CurrentIsNewer) => (
+            false,
+            "у вас версия новее опубликованной — ставить нечего".to_string(),
+        ),
+        Some(CheckOutcome::Unrecognized) => (
+            true,
+            "опубликованную версию не удалось разобрать — проверьте вручную".to_string(),
+        ),
+        Some(CheckOutcome::PublishedIsPrerelease(tag)) => (
+            false,
+            format!("опубликован только предрелиз {tag} — предрелизы не предлагаются"),
+        ),
+        Some(CheckOutcome::Failed(reason)) => (
+            true,
+            // Приёмка: отказ сети — НЕ «вы в курсе последней версии».
+            format!("проверка не удалась (сеть недоступна или сервер не ответил): {reason}"),
+        ),
+        Some(CheckOutcome::StagedForNextLaunch { tag }) => (
+            false,
+            format!(
+                "обновление {tag} скачано, подпись подтверждена — установится \
+                 при следующем запуске ProxyPilot"
+            ),
+        ),
+        Some(CheckOutcome::RefusedUnsigned { tag, reason }) => (
+            true,
+            format!(
+                "найдено обновление {tag}, но подпись не подтверждена — \
+                 обновление НЕ установлено ({reason}). Обновитесь вручную: \
+                 github.com/denislibs/proxy-pilot/releases"
+            ),
+        ),
+    }
+}
+
+fn update_status_note(status: &Option<CheckOutcome>) -> String {
+    let (bad, text) = update_status_text(status);
+    format!(
+        "<p class=\"note {cls}\">{text}</p>\n",
+        cls = if bad { "bad" } else { "good" },
+        text = escape_html(&text)
     )
 }
 
@@ -1786,6 +1874,7 @@ mod tests {
                 bound_port: 3129,
                 autostart,
                 tunnel: Arc::new(FakeTunnel::new(TunnelSnapshot::default())),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
             },
             rx,
         )
@@ -2126,6 +2215,7 @@ mod tests {
                 bound_port: 3129,
                 autostart: Arc::new(AutostartPending),
                 tunnel: Arc::new(tunnel),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
             },
             rx,
         )
@@ -2540,5 +2630,83 @@ mod tests {
         );
         let html = handle_post(&state, b"action=raise_tunnel").await;
         assert!(!html.contains("class=\"note bad\""), "получили: {html}");
+    }
+
+    // ---- Задача 3: раздел «Обновления» ----
+
+    #[test]
+    fn a_network_failure_is_never_worded_as_up_to_date() {
+        // Приёмка задачи буквально: отказ проверки не должен читаться как
+        // «вы в курсе последней версии».
+        let (bad, text) = update_status_text(&Some(CheckOutcome::Failed(
+            "тестовый отказ сети".to_string(),
+        )));
+        assert!(bad, "отказ обязан быть помечен как плохая новость");
+        assert!(!text.contains("последняя версия"), "получили: {text}");
+        assert_ne!(
+            update_status_text(&Some(CheckOutcome::Failed("x".to_string()))).1,
+            update_status_text(&Some(CheckOutcome::UpToDate)).1,
+            "текст отказа не должен совпасть с текстом «всё в порядке»"
+        );
+    }
+
+    #[test]
+    fn never_checked_is_worded_differently_from_up_to_date_and_from_failed() {
+        let (never_bad, never_text) = update_status_text(&None);
+        let (_, up_to_date_text) = update_status_text(&Some(CheckOutcome::UpToDate));
+        assert!(!never_bad, "«ещё не проверялось» — не плохая новость");
+        assert_ne!(never_text, up_to_date_text);
+    }
+
+    #[test]
+    fn a_refused_unsigned_update_says_plainly_that_nothing_installed() {
+        let (bad, text) = update_status_text(&Some(CheckOutcome::RefusedUnsigned {
+            tag: "v9.9.9".to_string(),
+            reason: "тестовый отказ подписи".to_string(),
+        }));
+        assert!(bad);
+        assert!(text.contains("НЕ установлено"), "получили: {text}");
+        assert!(text.contains("v9.9.9"), "получили: {text}");
+    }
+
+    #[test]
+    fn a_staged_update_is_reported_as_pending_the_next_launch() {
+        let (bad, text) = update_status_text(&Some(CheckOutcome::StagedForNextLaunch {
+            tag: "v9.9.9".to_string(),
+        }));
+        assert!(!bad);
+        assert!(text.contains("следующем запуске"), "получили: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_updates_section_reflects_the_toggle_and_the_last_status() {
+        let cfg = Config {
+            check_for_updates: false,
+            ..Config::default()
+        };
+        let (state, _rx) = state_with(app_state(3129, None), cfg);
+        state
+            .update_status
+            .store(Arc::new(Some(CheckOutcome::UpToDate)));
+        let html = render(&state, None);
+        assert!(
+            html.contains("id=\"check_for_updates\"")
+                || html.contains("name=\"check_for_updates\""),
+            "нет тумблера проверки обновлений: {html}"
+        );
+        // Выключенный тумблер не должен нести атрибут checked.
+        let toggle = html
+            .split("name=\"check_for_updates\"")
+            .nth(1)
+            .unwrap_or_default();
+        let before_closing_tag = &toggle[..toggle.find('>').unwrap_or(0)];
+        assert!(
+            !before_closing_tag.contains("checked"),
+            "тумблер обязан быть снят: {before_closing_tag}"
+        );
+        assert!(
+            html.contains("установлена последняя версия"),
+            "статус последней проверки не показан: {html}"
+        );
     }
 }

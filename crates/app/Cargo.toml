@@ -28,6 +28,11 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     # Системный ГСЧ (`BCryptGenRandom`) для токена страницы настроек.
     "Win32_Security_Cryptography",
+    # Проверка подписи Authenticode скачанного обновления (`update::verify`,
+    # `WinVerifyTrust`) — системный API, есть на любой Windows, в отличие от
+    # `signtool.exe` (инструмент Windows SDK, которого на машине получателя
+    # нет).
+    "Win32_Security_WinTrust",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_DataExchange",
@@ -37,6 +42,10 @@ windows = { workspace = true, features = [
     # `ShellExecuteW` — открыть страницу настроек в браузере пользователя.
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # Скачивание релиза с GitHub (`update::source`) через системный
+    # HTTPS-клиент Windows: TLS достаётся бесплатно от системы, а не от
+    # нового звена в дереве зависимостей, которое придётся подписывать.
+    "Win32_Networking_WinHttp",
 ] }
 
 # Только для теста WinAutostart в main.rs, который трогает реальный Run:
