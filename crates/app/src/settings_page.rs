@@ -607,6 +607,7 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
     b.push_str("</style></head>\n<body>\n");
 
     b.push_str("<h1>ProxyPilot</h1>\n");
+    b.push_str("<section class=\"card\">\n");
     b.push_str(&format!(
         "<p class=\"now\">Мост слушает <b>127.0.0.1:{port}</b> · {route}<br>{network}</p>\n",
         port = app.port,
@@ -623,11 +624,15 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             ));
         }
     }
+    b.push_str("</section>\n");
 
     // Форма настроек. Отдельная от кнопок замера и диагностики: те не
-    // должны тащить с собой поля, которые человек ещё правит.
+    // должны тащить с собой поля, которые человек ещё правит. Каждый раздел
+    // — своя карточка (`section.card`): границы разделов держит вёрстка, а
+    // не подчёркивание под заголовком.
     b.push_str("<form method=\"post\" action=\"\">\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"upstreams\">\n");
     b.push_str("<h2 id=\"upstreams\">Апстримы</h2>\n");
     // Что применяется сразу, а что при запуске, сказано у каждого раздела
     // своими словами: одна общая оговорка внизу страницы читается ровно теми,
@@ -641,15 +646,17 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         "socks_upstream",
         "SOCKS5",
         cfg.socks_upstream.as_deref().unwrap_or(""),
-        &health_text(cfg.socks_upstream.as_deref(), app.health.socks),
+        &health_chip(cfg.socks_upstream.as_deref(), app.health.socks),
     ));
     b.push_str(&field(
         "http_upstream",
         "HTTP-прокси",
         cfg.http_upstream.as_deref().unwrap_or(""),
-        &health_text(cfg.http_upstream.as_deref(), app.health.http),
+        &health_chip(cfg.http_upstream.as_deref(), app.health.http),
     ));
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"port\">\n");
     b.push_str("<h2 id=\"port\">Порт моста</h2>\n");
     b.push_str(&field(
         "bridge_port",
@@ -677,22 +684,26 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             bound = state.bound_port
         ));
     }
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"networks\">\n");
     b.push_str("<h2 id=\"networks\">Офисные сети</h2>\n");
     b.push_str(
         "<p class=\"hint\">Применяется сразу. Решение принимается по GUID: имя \
          сети человек может переименовать в любой момент. Чтобы убрать сеть — \
          очистите её GUID и сохраните.</p>\n",
     );
-    b.push_str("<table>\n<tr><th>GUID</th><th>Имя</th></tr>\n");
+    b.push_str("<div class=\"table-wrap\"><table>\n<tr><th>GUID</th><th>Имя</th></tr>\n");
     for net in cfg.office_networks.iter() {
         b.push_str(&office_row(&net.id, &net.name));
     }
     // Пустая строка для добавления руками. Пустой id отбрасывается при
     // разборе, поэтому нетронутая строка ничего не портит.
     b.push_str(&office_row("", ""));
-    b.push_str("</table>\n");
+    b.push_str("</table></div>\n");
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"tunnel-automation\">\n");
     b.push_str("<h2 id=\"tunnel-automation\">Автоматика туннеля</h2>\n");
     b.push_str(&checkbox(
         "automate_tunnel",
@@ -704,7 +715,9 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
          опускание по смене сети этот тумблер ещё не выполняет — управляйте \
          туннелем кнопками ниже.",
     ));
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"bypass\">\n");
     b.push_str("<h2 id=\"bypass\">Мимо прокси</h2>\n");
     b.push_str(&format!(
         "<label for=\"no_proxy\">Адреса и подсети, по одному в строке или через \
@@ -716,7 +729,9 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         "<p class=\"warn\">Список применяется при запуске: после изменения \
          перезапустите ProxyPilot.</p>\n",
     );
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"system\">\n");
     b.push_str("<h2 id=\"system\">Система</h2>\n");
     b.push_str(&checkbox(
         "manage_system_proxy",
@@ -739,8 +754,9 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         !autostart_note.is_empty(),
         &autostart_note,
     ));
+    b.push_str("</section>\n");
 
-    b.push_str("<p class=\"buttons\">");
+    b.push_str("<div class=\"actions\">");
     b.push_str("<button type=\"submit\" name=\"action\" value=\"save\">Сохранить</button>");
     // Кнопка «эта сеть — офис» — обычная кнопка отправки, а не скрипт: GUID
     // текущей сети сервер и так знает из `AppState.place`, а страница без
@@ -758,7 +774,7 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             escape_html(name)
         ));
     }
-    b.push_str("</p>\n</form>\n");
+    b.push_str("</div>\n</form>\n");
 
     // Раздел «Туннель» — отдельными формами по той же причине, что и замер
     // и диагностика ниже: каждая кнопка не должна тащить с собой поля
@@ -766,10 +782,13 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
     let tunnel_snapshot = state
         .tunnel
         .snapshot(&cfg.office_subnets, TUNNEL_PROFILE_NAME);
+    b.push_str("<section class=\"card\" aria-labelledby=\"tunnel\">\n");
     b.push_str(&tunnel_section(&cfg.office_subnets, &tunnel_snapshot));
+    b.push_str("</section>\n");
 
     // Замер и диагностика — отдельными формами: их кнопки не должны
     // отправлять поля настроек, которые человек ещё правит.
+    b.push_str("<section class=\"card\" aria-labelledby=\"bench\">\n");
     b.push_str("<h2 id=\"bench\">Замер скорости</h2>\n");
     b.push_str(&format!(
         "<p class=\"hint\">Один поток и короткий файл: цифры сравнивают \
@@ -777,43 +796,191 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         escape_html(BENCH_URL)
     ));
     b.push_str(
-        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
-         value=\"bench\">Замерить</button></form>\n",
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"bench\">Замерить</button></form>\n",
     );
     if let Some(results) = outcome.and_then(|o| o.bench.as_ref()) {
         b.push_str(&bench_table(results));
     }
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"doctor\">\n");
     b.push_str("<h2 id=\"doctor\">Диагностика</h2>\n");
     b.push_str(
-        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
-         value=\"doctor\">Проверить</button></form>\n",
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"doctor\">Проверить</button></form>\n",
     );
     if let Some(checks) = outcome.and_then(|o| o.doctor.as_ref()) {
         b.push_str(&doctor_table(checks));
     }
+    b.push_str("</section>\n");
 
     b.push_str("</body></html>\n");
     b
 }
 
-const STYLE: &str = "\
-body{font:14px/1.5 'Segoe UI',system-ui,sans-serif;margin:2rem auto;max-width:46rem;padding:0 1rem}\
-h1{font-size:1.4rem}h2{font-size:1.05rem;margin-top:1.8rem;border-bottom:1px solid #ccc;padding-bottom:.2rem}\
-label{display:block;margin-top:.8rem}\
-input[type=text],textarea{width:100%;box-sizing:border-box;font-family:inherit}\
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.2rem .4rem 0 0}\
-.now{background:#f3f3f3;padding:.6rem;border-radius:4px}\
-.hint,.warn,.note{margin:.4rem 0}.hint{color:#555}.warn{color:#7a4a00}\
-.note{padding:.5rem;border-radius:4px}.note.good{background:#e6f4e6}.note.bad{background:#fbe6e6}\
-.buttons{margin-top:1.4rem}button{margin-right:.6rem;padding:.4rem .9rem}\
-.ok{color:#1a6b1a}.fail{color:#a11}.pre{white-space:pre-wrap;font-family:Consolas,monospace}";
+/// Вся вёрстка страницы — один инлайн `<style>`, потому что CSP разрешает
+/// именно это (`style-src 'self' 'unsafe-inline'`) и запрещает вообще любой
+/// скрипт: значит состояния, переключатели и раскладка обязаны решаться
+/// чистым CSS (`:has()`, `:focus-visible`, `accent-color`-подобные трюки на
+/// нативном `<input type=checkbox>`, медиа-запросы), а не JS.
+///
+/// Три принципа, которые тут закодированы:
+///
+/// 1. **Тёмная тема — через `prefers-color-scheme`, без переключателя.**
+///    Трей живёт на рабочем столе, где тёмная тема — обычное дело; второй
+///    системы цветов, кроме системной, здесь нет и не должно быть.
+/// 2. **Состояние — не только цветом.** «доступен» / «недоступен» / «не
+///    задан» и «ок» / «внимание» / «отказ» получают ещё и разную форму
+///    значка (кружок с «✓», «✕», «!», «…», «—»), потому что часть людей не
+///    отличает красный от зелёного — тот же довод, по которому иконки в
+///    трее различаются формой, а не только цветом.
+/// 3. **Ни один шрифт не подгружается извне.** Сокет — локальный,
+///    `default-src 'self'` не пропустит ни один внешний хост, поэтому оба
+///    стека — только системные гарнитуры Windows.
+const STYLE: &str = r#"
+:root{
+  --bg:#f3f4f6;--bg-elevated:#ffffff;--fg:#1a1d21;--fg-muted:#5b6169;
+  --border:#d9dce1;--accent:#2f5fd6;--focus:#2f5fd6;--focus-ring:rgba(47,95,214,.28);
+  --good-fg:#146c37;--good-bg:#e3f5e9;--bad-fg:#a3241c;--bad-bg:#fbe8e6;
+  --warn-fg:#8a5a00;--warn-bg:#fbf0d9;
+  --sans:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
+  --mono:'Cascadia Mono',Consolas,'Courier New',monospace;--radius:10px;
+}
+/* Тёмная тема следует системной настройке; собственного переключателя нет
+   намеренно — на странице без скрипта переключать было бы нечем. */
+@media (prefers-color-scheme:dark){:root{
+  --bg:#15171b;--bg-elevated:#1e2126;--fg:#e8eaed;--fg-muted:#9aa0a8;
+  --border:#33373e;--accent:#7aa5ff;--focus:#7aa5ff;--focus-ring:rgba(122,165,255,.35);
+  --good-fg:#5fd88b;--good-bg:#173225;--bad-fg:#ff9086;--bad-bg:#3a201f;
+  --warn-fg:#f0c14b;--warn-bg:#3a2f12;
+}}
+*{box-sizing:border-box}
+body{font:15px/1.55 var(--sans);margin:0;padding:2.25rem 1rem 4rem;max-width:44rem;
+  margin-inline:auto;background:var(--bg);color:var(--fg)}
+h1{font-size:1.55rem;font-weight:650;letter-spacing:-.01em;margin:.1rem 0 1.4rem}
+h2{font-size:1.02rem;font-weight:650;margin:0 0 .8rem;color:var(--fg)}
+section.card{background:var(--bg-elevated);border:1px solid var(--border);
+  border-radius:var(--radius);padding:1.15rem 1.3rem;margin-bottom:1rem;
+  box-shadow:0 1px 2px rgba(0,0,0,.05)}
+label{display:block;margin-top:.9rem;font-weight:500}
+input[type=text],textarea{width:100%;font:inherit;color:var(--fg);background:var(--bg);
+  border:1px solid var(--border);border-radius:8px;padding:.5rem .65rem;margin-top:.35rem;
+  transition:border-color .15s,box-shadow .15s}
+textarea{min-height:5rem;resize:vertical}
+input[type=text]:focus-visible,textarea:focus-visible{
+  outline:none;border-color:var(--focus);box-shadow:0 0 0 3px var(--focus-ring)}
+table{border-collapse:collapse;width:100%;font-size:.92rem}
+th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border)}
+th{font-weight:600;color:var(--fg-muted);font-size:.78rem;text-transform:uppercase;
+  letter-spacing:.03em}
+table input[type=text]{margin-top:0}
+.table-wrap{overflow-x:auto;margin-top:.5rem}
+/* Нативный чекбокс перерисован в переключатель чистым CSS — `appearance:none`
+   плюс `::before` для ползунка; никакого скрипта для этого не нужно. */
+label:has(>input[type=checkbox]){display:flex;align-items:center;gap:.65rem;
+  padding:.45rem 0;cursor:pointer;font-weight:500}
+input[type=checkbox]{appearance:none;-webkit-appearance:none;width:2.15rem;height:1.2rem;
+  border-radius:999px;background:var(--border);position:relative;flex:none;margin:0;
+  cursor:pointer;transition:background-color .15s}
+input[type=checkbox]::before{content:"";position:absolute;top:2px;left:2px;width:1rem;
+  height:1rem;border-radius:50%;background:var(--bg-elevated);
+  box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}
+input[type=checkbox]:checked{background:var(--accent)}
+input[type=checkbox]:checked::before{transform:translateX(.95rem)}
+input[type=checkbox]:disabled{opacity:.5;cursor:not-allowed}
+input[type=checkbox]:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+button{font:inherit;font-weight:600;border:1px solid var(--accent);border-radius:8px;
+  padding:.55rem 1.1rem;min-height:2.5rem;cursor:pointer;background:var(--accent);
+  color:#fff;transition:filter .15s,transform .05s}
+button:hover{filter:brightness(1.08)}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+/* Кнопка «Сохранить» — единственное основное действие формы, поэтому
+   единственная сплошная; сеть-в-офис и кнопки разделов ниже — второстепенные
+   действия, поэтому контурные (тот же язык, что у переключателя). */
+button[value=office]{background:transparent;color:var(--accent)}
+button[value=office]:hover{background:var(--accent);color:#fff}
+form.action button{background:transparent;color:var(--accent)}
+form.action button:hover{background:var(--accent);color:#fff}
+/* Установка службы — единственный путь к UAC во всём приложении (см.
+   CLAUDE.md, «Права администратора») — помечена отдельным цветом, чтобы
+   не потеряться среди обычных кнопок. */
+form.action button[value=install_service]{color:var(--warn-fg);border-color:var(--warn-fg)}
+form.action button[value=install_service]:hover{background:var(--warn-fg);color:#fff}
+form.action{display:inline-block;margin:0 .5rem .5rem 0}
+.actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1.2rem}
+.now{background:var(--bg);border:1px dashed var(--border);border-radius:8px;
+  padding:.75rem .9rem;font-size:.95rem;line-height:1.6}
+.now b{font-variant-numeric:tabular-nums}
+.hint{color:var(--fg-muted);font-size:.88rem;margin:.4rem 0}
+.warn{color:var(--warn-fg);font-size:.88rem;margin:.5rem 0;padding:.5rem .7rem;
+  background:var(--warn-bg);border-radius:8px}
+.note{margin:.5rem 0;padding:.6rem .8rem;border-radius:8px;font-size:.92rem;
+  display:flex;align-items:flex-start;gap:.55rem}
+.note::before{flex:none;font-weight:700}
+.note.good{background:var(--good-bg);color:var(--good-fg)}
+.note.good::before{content:"✓"}
+.note.bad{background:var(--bad-bg);color:var(--bad-fg)}
+.note.bad::before{content:"✕"}
+/* Значок статуса апстрима — форма плюс цвет, не только цвет (см. докблок
+   константы). */
+.chip{display:inline-flex;align-items:center;gap:.3rem;font-size:.82rem;font-weight:600;
+  padding:.15rem .55rem;border-radius:999px}
+.chip::before{font-weight:700}
+.chip.status-up{background:var(--good-bg);color:var(--good-fg)}
+.chip.status-up::before{content:"✓"}
+.chip.status-down{background:var(--bad-bg);color:var(--bad-fg)}
+.chip.status-down::before{content:"✕"}
+.chip.status-unknown{background:var(--warn-bg);color:var(--warn-fg)}
+.chip.status-unknown::before{content:"…"}
+.chip.status-unset{background:var(--border);color:var(--fg-muted)}
+.chip.status-unset::before{content:"—"}
+.checks{list-style:none;margin:.75rem 0 0;padding:0}
+.check{display:flex;gap:.65rem;align-items:flex-start;padding:.65rem .8rem;
+  border:1px solid var(--border);border-radius:8px;margin-bottom:.5rem;background:var(--bg)}
+.check::before{flex:none;width:1.3rem;height:1.3rem;border-radius:50%;display:flex;
+  align-items:center;justify-content:center;font-size:.78rem;font-weight:700;color:#fff}
+.check.ok::before{content:"✓";background:var(--good-fg)}
+.check.warn::before{content:"!";background:var(--warn-fg)}
+.check.fail::before{content:"✕";background:var(--bad-fg)}
+.check-body{flex:1;min-width:0}
+.check-head{display:flex;justify-content:space-between;gap:.6rem;flex-wrap:wrap}
+.check-title{font-weight:600}
+.check-status{font-size:.72rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.03em;color:var(--fg-muted)}
+.check-detail{margin-top:.3rem;font-family:var(--mono);font-size:.82rem;
+  color:var(--fg-muted);white-space:pre-wrap;word-break:break-word}
+.bench-results{list-style:none;margin:.75rem 0 0;padding:0}
+.bench-row{display:grid;grid-template-columns:1fr auto auto;gap:.4rem 1rem;
+  align-items:center;padding:.55rem .8rem;border:1px solid var(--border);border-radius:8px;
+  margin-bottom:.4rem;background:var(--bg)}
+.bench-row.winner{border-color:var(--good-fg)}
+.bench-row.failed{border-color:var(--bad-fg)}
+.bench-label{font-weight:600}
+.bench-speed{font-variant-numeric:tabular-nums;color:var(--fg-muted)}
+.ok{color:var(--good-fg);font-weight:600}
+.fail{color:var(--bad-fg);font-weight:600}
+/* Страница открывается в том окне браузера, какое случится — узкое не
+   исключение. */
+@media (max-width:480px){
+  body{padding:1.4rem .75rem 3rem}
+  section.card{padding:.9rem 1rem}
+  .bench-row{grid-template-columns:1fr}
+  .check-head{flex-direction:column;gap:.15rem}
+}
+"#;
 
-fn field(name: &str, label: &str, value: &str, note: &str) -> String {
-    let note = if note.is_empty() {
+/// `note_html` — уже готовая разметка (значок статуса или пусто), не
+/// сырой текст: единственный вызывающий, которому есть что показать
+/// (апстримы), собирает её через [`health_chip`], которая экранирует
+/// текст сама. Собственного экранирования здесь поэтому нет — второе
+/// было бы дублем первого, а не защитой.
+fn field(name: &str, label: &str, value: &str, note_html: &str) -> String {
+    let note = if note_html.is_empty() {
         String::new()
     } else {
-        format!(" <span class=\"hint\">{}</span>", escape_html(note))
+        format!(" {note_html}")
     };
     format!(
         "<label for=\"{name}\">{label}{note}</label>\n\
@@ -1009,8 +1176,8 @@ fn tunnel_section(office_subnets: &[Ipv4Net], snap: &TunnelSnapshot) -> String {
 
 fn tunnel_action_form(action: &str, label: &str) -> String {
     format!(
-        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
-         value=\"{action}\">{label}</button></form>\n",
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"{action}\">{label}</button></form>\n",
         action = escape_html(action),
         label = escape_html(label),
     )
@@ -1028,6 +1195,31 @@ fn health_text(addr: Option<&str>, health: Reachability) -> String {
         Reachability::Down => "недоступен".to_string(),
         Reachability::Unknown => "ещё не проверен".to_string(),
     }
+}
+
+/// Класс значка для того же состояния, что и [`health_text`] — разнесены,
+/// а не слиты в одну строку «class:text»: два места, разбирающих такую
+/// строку обратно, были бы более хрупким кодом, чем два маленьких `match`.
+fn health_class(addr: Option<&str>, health: Reachability) -> &'static str {
+    if addr.is_none_or(str::is_empty) {
+        return "status-unset";
+    }
+    match health {
+        Reachability::Up => "status-up",
+        Reachability::Down => "status-down",
+        Reachability::Unknown => "status-unknown",
+    }
+}
+
+/// Готовый значок статуса апстрима для вставки в разметку — форма (через
+/// класс, см. докблок [`STYLE`]) плюс текст, который уже нельзя спутать по
+/// смыслу (те же три слова, что и в трее).
+fn health_chip(addr: Option<&str>, health: Reachability) -> String {
+    format!(
+        "<span class=\"chip {}\">{}</span>",
+        health_class(addr, health),
+        escape_html(&health_text(addr, health))
+    )
 }
 
 /// То же, что показывает заголовок меню: что с трафиком происходит НА САМОМ
@@ -1063,36 +1255,50 @@ fn network_text(app: &AppState) -> String {
     }
 }
 
+/// Результаты замера — список карточек, а не таблица: у каждого маршрута
+/// свой блок с рамкой, подсвеченной по исходу (победитель / отказ), а не
+/// строка среди прочих строк. Тот же довод, что у [`doctor_table`].
 fn bench_table(results: &[BenchResult]) -> String {
     let best = fastest(results).map(|r| r.label.clone());
-    let mut out = String::from("<table>\n<tr><th>Маршрут</th><th>Скорость</th><th></th></tr>\n");
+    let mut out = String::from("<ul class=\"bench-results\">\n");
     for r in results {
+        let is_winner = best.as_deref() == Some(r.label.as_str());
+        // Путь, который не отработал, показывается как не отработавший, а не
+        // пропускается: пропущенная строка выглядела бы как «не настроен».
+        let row_class = if r.error.is_some() {
+            "failed"
+        } else if is_winner {
+            "winner"
+        } else {
+            ""
+        };
         let speed = match r.speed_bps() {
             Some(bps) => format!("{:.2} МБ/с", bps as f64 / 1_048_576.0),
             None => "—".to_string(),
         };
-        // Путь, который не отработал, показывается как не отработавший, а не
-        // пропускается: пропущенная строка выглядела бы как «не настроен».
         let note = match &r.error {
             Some(e) => format!("<span class=\"fail\">{}</span>", escape_html(e)),
-            None if best.as_deref() == Some(r.label.as_str()) => {
-                "<span class=\"ok\">быстрее прочих</span>".to_string()
-            }
+            None if is_winner => "<span class=\"ok\">быстрее прочих</span>".to_string(),
             None => format!("{} байт", r.bytes),
         };
         out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<li class=\"bench-row {row_class}\"><span class=\"bench-label\">{}</span>\
+             <span class=\"bench-speed\">{}</span><span class=\"bench-note\">{}</span></li>\n",
             escape_html(&r.label),
             escape_html(&speed),
             note
         ));
     }
-    out.push_str("</table>\n");
+    out.push_str("</ul>\n");
     out
 }
 
+/// Диагностика — список результатов, каждый со своим значком (форма, не
+/// только цвет — см. докблок [`STYLE`]), а не таблица из строк
+/// преформатированного текста: результат должен читаться как результат, а
+/// не как вывод консоли.
 fn doctor_table(checks: &[Check]) -> String {
-    let mut out = String::from("<table>\n");
+    let mut out = String::from("<ul class=\"checks\">\n");
     for c in checks {
         let (cls, mark) = match c.status {
             CheckStatus::Ok => ("ok", "ок"),
@@ -1100,13 +1306,15 @@ fn doctor_table(checks: &[Check]) -> String {
             CheckStatus::Fail => ("fail", "отказ"),
         };
         out.push_str(&format!(
-            "<tr><td class=\"{cls}\">{mark}</td><td><b>{title}</b><div class=\"pre\">\
-             {detail}</div></td></tr>\n",
+            "<li class=\"check {cls}\"><div class=\"check-body\">\
+             <div class=\"check-head\"><span class=\"check-title\">{title}</span>\
+             <span class=\"check-status\">{mark}</span></div>\
+             <div class=\"check-detail\">{detail}</div></div></li>\n",
             title = escape_html(&c.title),
             detail = escape_html(&c.detail),
         ));
     }
-    out.push_str("</table>\n");
+    out.push_str("</ul>\n");
     out
 }
 
