@@ -339,3 +339,212 @@ proxypilot-winnet    (lib unittests):         158 passed; 0 failed; 2 ignored
 Сетевая часть (`GithubSource`) и полный цикл самообновления на живом
 бинаре — не проверены эмпирически по прямому ограничению задачи, это не
 скрыто.
+
+## Fix round 1 — предел глубины у самодельного JSON-парсера
+
+Контроллер нашёл настоящую дыру, не придирку: `crates/app/src/update/json.rs`
+разбирал JSON рекурсивным спуском (`parse_value` ↔ `parse_object`/
+`parse_array`) без предела глубины и без предела на размер тела ответа,
+скачиваемого в память (`source.rs`). Вход в обе функции — байты из сети.
+
+**Почему это серьёзнее обычной находки о робастности.** Переполнение стека в
+Rust — это `abort`, а не перехватываемая паника: оно не разворачивает стек и
+не запускает ни один `Drop`, в частности `RestoreOnDrop` (`crates/app/src/proxy.rs`)
+— единственный код, который возвращает системный прокси Windows на выходе
+процесса (`CLAUDE.md`, «Любой путь завершения процесса восстанавливает
+системный прокси»). Ответ вида `[[[[[…` с достаточным числом скобок от
+GitHub-подобного сервера (настоящего, скомпрометированного, или просто
+чужого ответа, случайно прилетевшего на этот путь) убивал бы процесс так,
+что реестр остаётся указывать на `127.0.0.1:PORT`, где никто больше не
+слушает, — то самое состояние, ради недопущения которого вся сторожевая
+машинерия и существует, и она эту конкретную дыру не видит и не может
+увидеть.
+
+### Что сделано
+
+1. **Предел глубины** — `crates/app/src/update/json.rs`, `MAX_DEPTH = 32`.
+   `depth: u32` проведён через `parse_value`/`parse_object`/`parse_array`
+   как параметр (растёт только в одной точке — там, где `parse_value`
+   решает спуститься в `{`/`[`), и превышение — `Err` с текстом «вложен
+   глубже 32 уровней», не рекурсия дальше. Ответ GitHub Releases API
+   вкладывается на 3-4 уровня; 32 — генеральский запас, а не подгонка.
+2. **Предел размера тела, проверяемый ПОКА идёт чтение** — `crates/app/src/update/source.rs`,
+   `mod winhttp::read_body`. Раньше был один общий потолок 64 МиБ на
+   ЛЮБОЙ ответ; теперь их два, и оба проверяются на каждой итерации цикла
+   чтения (`WinHttpQueryDataAvailable`/`WinHttpReadData`), а не постфактум:
+   `MAX_API_RESPONSE_BYTES = 1 МиБ` для ответа со списком релизов (сам
+   список — считаные килобайты, форма подтверждена read-only обращением к
+   живому API, см. раздел выше) и `MAX_DOWNLOAD_BYTES = 64 МиБ` для файла
+   ассета (`proxypilot.exe` весит единицы МиБ). Компилируемая проверка
+   `const _: () = assert!(MAX_DOWNLOAD_BYTES > MAX_API_RESPONSE_BYTES);`
+   ловит опечатку в константах ещё до тестов.
+3. **Аудит на панику по каждому пункту, который назвал контроллер** —
+   глубокая вложенность (пункт 1), усечение на середине токена
+   (`rejects_truncated_json`, `a_truncated_unicode_escape_is_an_error_not_a_panic`,
+   `a_trailing_backslash_is_an_error_not_a_panic`, плюс fuzz-тест обрезки
+   ниже), невалидный UTF-8 (см. «Что НЕ проверено» ниже — почему это в
+   принципе недостижимо для `json::parse`, а не «проверено и починено»),
+   незакрытые строки (`rejects_an_unterminated_string`), абсурдные числа
+   (`an_absurdly_long_number_does_not_panic` — 400-значное число, `f64`
+   уходит в `inf`, не в панику), голый `-` (`a_bare_minus_is_a_parse_error_not_a_panic`),
+   одинокие суррогаты в `\u`-escape (`a_lone_high_surrogate_does_not_panic`,
+   `a_lone_low_surrogate_does_not_panic`).
+4. **Враждебные тесты** — три штуки, не горсть отобранных случаев:
+   - `truncations_of_a_valid_document_at_every_byte_offset_never_panic` —
+     обрезает настоящий (валидный) документ ответа API на КАЖДОМ байте от 0
+     до полной длины и просто зовёт `parse`, игнорируя `Ok`/`Err`: важен
+     только сам факт возврата.
+   - `random_json_flavoured_byte_soup_never_panics_or_hangs` и
+     `random_byte_soup_outside_the_json_alphabet_never_panics` — 5000
+     мутаций каждая, из собственного детерминированного ГСЧ (`xorshift64`,
+     без крейта `rand` — та же причина отсутствия `serde_json`, см. выше),
+     один алфавит смещён в сторону синтаксиса JSON (скобки, кавычки,
+     `\u`, цифры), второй — произвольные печатные ASCII-байты.
+
+### Что НЕ сделано и почему — честно
+
+- **Не воспроизводил настоящее переполнение стека на старом коде.**
+  Переполнение стека абортит весь процесс `cargo test` (все тесты работают
+  потоками одного процесса, а не отдельными процессами), а не один тест —
+  запускать это ради демонстрации значило бы намеренно уронить сессию ради
+  красивой строки в отчёте. Контроллер попросил тесты на «вход чуть за
+  пределом» и «намного за пределом», а не буквальный `abort` — это и
+  сделано: `nesting_one_level_past_the_limit_is_a_clean_error` и
+  `nesting_far_past_the_limit_is_rejected_not_a_stack_overflow` (50 000
+  вложенных скобок) доказывают, что оба случая возвращают чистую ошибку, а
+  не зависают и не падают. Это не реконструированный красный прогон —
+  просто не поставленный намеренно самоубийственный эксперимент.
+- **Невалидный UTF-8 не тестируется отдельно в `json.rs`, потому что
+  структурно не может туда попасть.** `json::parse` принимает `&str`, а не
+  `&[u8]` — гарантия валидности UTF-8 в этой точке даёт компилятор, а не
+  код. Граница, где сырые байты сети превращаются в `&str`, — это
+  `source.rs::winhttp::get_https`, и там стоит безопасный
+  `String::from_utf8(body).map_err(...)`, а не `from_utf8_unchecked`: битый
+  UTF-8 из сети отклоняется `Err` на ОДИН уровень раньше `json::parse`,
+  до, а не после того, как парсер вообще увидит эти байты. Внутренняя
+  byte-level логика `parse_string` (сборка многобайтовых символов через
+  `utf8_len`) написана защитно и безопасна сама по себе (доказано fuzz-
+  тестами выше — она получает мусор наравне со всем остальным), но
+  специального теста «подать невалидный UTF-8» в `json.rs` нет, потому что
+  подать его туда типами нельзя.
+- **Что происходит со скачиванием при превышении потолка размера — теперь
+  явно.** `download_https` вызывает `std::fs::write(dest, …)` РОВНО ОДИН
+  раз и только ПОСЛЕ того, как всё тело уже целиком в памяти в пределах
+  `MAX_DOWNLOAD_BYTES`; если чтение оборвалось по потолку, по сети или по
+  отказу `WinHTTP`, функция возвращает `Err` раньше, чем вообще коснулась
+  `dest` — файл не создаётся и не остаётся полузаписанным. Дополнительный
+  защитный слой уже был и до этой правки: `check.rs::stage` вызывает
+  `std::fs::remove_file(&partial)` на любой отказ `source.download(...)`
+  независимо от причины — для полузаписанного файла это было бы реальным
+  удалением, для никогда не созданного (как здесь) — безвредным `no-op`.
+  Сама сетевая часть по-прежнему не проверена запуском (см. раздел выше) —
+  это утверждение о том, что делает код по написанию, а не о том, что
+  доказано живым обрывом соединения.
+
+### RED → GREEN этого раунда
+
+Прогон новых тестов сразу после реализации — зелёный с первой попытки (27
+тестов в `json.rs`, было 13, +14):
+
+```
+running 27 tests
+test update::json::tests::a_bare_minus_is_a_parse_error_not_a_panic ... ok
+test update::json::tests::a_lone_low_surrogate_does_not_panic ... ok
+test update::json::tests::an_empty_array_response_parses_as_an_array ... ok
+test update::json::tests::deeply_nested_objects_are_bounded_the_same_way_as_arrays ... ok
+test update::json::tests::a_truncated_unicode_escape_is_an_error_not_a_panic ... ok
+test update::json::tests::parses_a_flat_object ... ok
+test update::json::tests::an_absurdly_long_number_does_not_panic ... ok
+test update::json::tests::a_literal_multibyte_utf8_string_is_copied_through ... ok
+test update::json::tests::nesting_far_past_the_limit_is_rejected_not_a_stack_overflow ... ok
+test update::json::tests::a_confusing_string_field_does_not_fool_key_lookup ... ok
+test update::json::tests::nesting_exactly_at_the_limit_still_parses ... ok
+test update::json::tests::a_trailing_backslash_is_an_error_not_a_panic ... ok
+test update::json::tests::an_unknown_escape_is_an_error_not_a_panic ... ok
+test update::json::tests::parses_numbers_bool_and_null ... ok
+test update::json::tests::a_lone_high_surrogate_does_not_panic ... ok
+test update::json::tests::parses_nested_arrays_of_objects_like_the_real_api_shape ... ok
+test update::json::tests::parses_an_empty_object ... ok
+test update::json::tests::nesting_one_level_past_the_limit_is_a_clean_error ... ok
+test update::json::tests::rejects_an_unterminated_string ... ok
+test update::json::tests::rejects_truncated_json ... ok
+test update::json::tests::rejects_trailing_garbage ... ok
+test update::json::tests::unescapes_a_surrogate_pair ... ok
+test update::json::tests::unescapes_unicode_code_points ... ok
+test update::json::tests::unescapes_standard_sequences ... ok
+test update::json::tests::truncations_of_a_valid_document_at_every_byte_offset_never_panic ... ok
+test update::json::tests::random_byte_soup_outside_the_json_alphabet_never_panics ... ok
+test update::json::tests::random_json_flavoured_byte_soup_never_panics_or_hangs ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.01s
+```
+
+### RED, реально пойманная clippy (на страж-константах, не на новой логике)
+
+Первая версия стража от рассогласования размерных констант была
+рантайм-`assert!` внутри `#[test]` над двумя `const`-величинами — clippy
+справедливо возразил:
+
+```
+error: this assertion has a constant value
+   --> crates\app\src\update\source.rs:455:13
+    |
+455 |             assert!(MAX_API_RESPONSE_BYTES > 0);
+    = help: consider moving this into a const block: `const { assert!(..) }`
+error: this assertion has a constant value
+   --> crates\app\src\update\source.rs:456:13
+    |
+456 |             assert!(MAX_DOWNLOAD_BYTES > MAX_API_RESPONSE_BYTES);
+error: could not compile `proxypilot-app` (bin "proxypilot" test) due to 2 previous errors
+```
+
+Заменено на `const _: () = assert!(MAX_DOWNLOAD_BYTES > MAX_API_RESPONSE_BYTES);`
+вне `#[cfg(test)]` — проверка ушла на этап компиляции и стала СИЛЬНЕЕ (ловит
+нарушение даже в релизной сборке без тестов), а не просто обошла находку.
+
+### GREEN: все три обязательные команды CI после исправления
+
+```
+$ cargo test --all --offline
+proxypilot-app       (bin unittests):        219 passed; 0 failed; 1 ignored
+proxypilot-app       (tests/version_resource): 1 passed; 0 failed
+proxypilot-bridge    (lib unittests):          69 passed; 0 failed
+proxypilot-bridge    (tests/cli):               2 passed; 0 failed
+proxypilot-core      (lib unittests):          88 passed; 0 failed
+proxypilot-icon      (lib unittests):           2 passed; 0 failed
+proxypilot-netsvc    (lib unittests):          43 passed; 0 failed
+proxypilot-winnet    (lib unittests):         158 passed; 0 failed; 2 ignored
+```
+
+Итого **582 passed, 0 failed, 3 ignored** (было 568 после первого прохода
+задачи; +14 в `json.rs` за счёт враждебных тестов, минус 1 — рантайм-тест
+констант заменён компилируемым стражем, см. выше).
+
+```
+$ cargo clippy --all-targets --offline -- -D warnings
+    Checking proxypilot-app v0.1.0 (...)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.16s
+```
+
+`cargo fmt --all --check` — код без вывода, выход 0.
+
+```
+$ cargo +1.88.0 check --all --all-targets --offline --locked
+    Checking proxypilot-app v0.1.0 (...)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.60s
+```
+
+`Cargo.lock` по-прежнему не тронут этим раундом (`git status` подтверждает
+— изменения только в `crates/app/src/update/json.rs` и
+`crates/app/src/update/source.rs`).
+
+### Статус после fix round 1
+
+Дыра со стеком закрыта явным, проверенным пределом глубины, а не
+предположением «маловероятно». Потолок размера тела теперь проверяется на
+лету и раздельно по назначению (API-ответ vs файл), с явным
+компилируемым стражем от рассогласования между ними. Поведение при
+превышении потолка скачивания задокументировано и не оставляет
+полузаписанных файлов — по устройству кода (`fs::write` один раз, в самом
+конце), а не по дополнительной проверке, которую пришлось бы добавлять
+отдельно.

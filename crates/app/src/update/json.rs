@@ -16,8 +16,39 @@
 //! гарантирован контрактом, а значения — не наши (сеть недоверенная целиком),
 //! и строка типа `"name": "\"tag_name\": подделка"` внутри чужого поля не
 //! должна путать поиск нужного.
+//!
+//! **Вход — байты из сети, а не доверенный текст.** `parse_value` ↔
+//! `parse_object`/`parse_array` взаимно рекурсивны по глубине вложенности
+//! JSON, и без предела эта глубина — это глубина СТЕКА ВЫЗОВОВ. Тело вида
+//! `[[[[[…` с достаточным числом скобок переполнило бы стек; переполнение
+//! стека в Rust — это `abort`, а не `panic`, оно НЕ разворачивает стек и не
+//! запускает ни один `Drop` — в частности, `RestoreOnDrop` (`proxy.rs`),
+//! чья единственная работа — вернуть системный прокси на выход из процесса.
+//! Процесс, упавший так, оставляет реестр указывающим на `127.0.0.1:PORT`,
+//! где никто больше не слушает, — то самое состояние, ради недопущения
+//! которого весь этот сторож и заведён (`CLAUDE.md`, «Любой путь завершения
+//! процесса восстанавливает системный прокси»). Поэтому [`MAX_DEPTH`] —
+//! обязательный параметр, а не защита «на всякий случай»: без него ответ
+//! от сети мог бы обрушить весь продукт способом, которого штатный сторож
+//! не видит и не может увидеть.
+//!
+//! Вторая половина того же требования — **ни один вход не паникует**, а не
+//! только не переполняет стек: усечённый на середине токена ответ, битый
+//! `\uXXXX`, голый `-` без цифр, одинокий суррогат — всё это `Err`, не
+//! `unwrap`/индексация мимо границ. Тесты `hostile` внизу гоняют это не
+//! горсткой отобранных случаев, а генерируемыми и мутированными строками:
+//! только «не паникует» здесь ценнее десятка удачно угаданных примеров,
+//! потому что вход не наш и предугадать его форму нельзя в принципе.
 
 use std::collections::BTreeMap;
+
+/// Потолок вложенности объектов/массивов друг в друга. Ответ GitHub Releases
+/// API вкладывает не больше 3-4 уровней (объект релиза → массив `assets` →
+/// объект ассета → изредка вложенный `uploader`); 32 — генеральский запас
+/// поверх этого, а не тесная подгонка под конкретный ответ, и всё ещё
+/// исчезающе маленькая глубина рекурсии для любого стека потока (в том
+/// числе для `spawn_blocking`, откуда этот разбор и вызывается).
+const MAX_DEPTH: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
@@ -61,7 +92,7 @@ impl Json {
 pub fn parse(text: &str) -> Result<Json, String> {
     let bytes = text.as_bytes();
     let mut pos = skip_ws(bytes, 0);
-    let (value, next) = parse_value(bytes, pos)?;
+    let (value, next) = parse_value(bytes, pos, 0)?;
     pos = skip_ws(bytes, next);
     if pos != bytes.len() {
         return Err(format!("лишние данные после значения на байте {pos}"));
@@ -76,11 +107,20 @@ fn skip_ws(b: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn parse_value(b: &[u8], pos: usize) -> Result<(Json, usize), String> {
+/// `depth` — сколько объектов/массивов уже открыто СНАРУЖИ этого значения
+/// (0 на верхнем уровне). Растёт только здесь, в единственной точке, откуда
+/// разбор уходит вглубь ([`parse_object`]/[`parse_array`]) — оба они лишь
+/// передают то же самое `depth + 1` каждому вложенному значению, ни разу не
+/// увеличивая его сами, поэтому предел проверяется ровно один раз на
+/// уровень, а не может быть случайно обойдён вторым местом инкремента.
+fn parse_value(b: &[u8], pos: usize, depth: u32) -> Result<(Json, usize), String> {
     let pos = skip_ws(b, pos);
     match b.get(pos) {
-        Some(b'{') => parse_object(b, pos),
-        Some(b'[') => parse_array(b, pos),
+        Some(b'{') | Some(b'[') if depth >= MAX_DEPTH => Err(format!(
+            "JSON вложен глубже {MAX_DEPTH} уровней на байте {pos} — отклонено"
+        )),
+        Some(b'{') => parse_object(b, pos, depth + 1),
+        Some(b'[') => parse_array(b, pos, depth + 1),
         Some(b'"') => {
             let (s, next) = parse_string(b, pos)?;
             Ok((Json::String(s), next))
@@ -93,7 +133,7 @@ fn parse_value(b: &[u8], pos: usize) -> Result<(Json, usize), String> {
     }
 }
 
-fn parse_object(b: &[u8], mut pos: usize) -> Result<(Json, usize), String> {
+fn parse_object(b: &[u8], mut pos: usize, depth: u32) -> Result<(Json, usize), String> {
     pos += 1; // '{'
     let mut map = BTreeMap::new();
     pos = skip_ws(b, pos);
@@ -111,7 +151,7 @@ fn parse_object(b: &[u8], mut pos: usize) -> Result<(Json, usize), String> {
             return Err(format!("ожидалось «:» на байте {pos}"));
         }
         pos += 1;
-        let (value, next) = parse_value(b, pos)?;
+        let (value, next) = parse_value(b, pos, depth)?;
         map.insert(key, value);
         pos = skip_ws(b, next);
         match b.get(pos) {
@@ -124,7 +164,7 @@ fn parse_object(b: &[u8], mut pos: usize) -> Result<(Json, usize), String> {
     }
 }
 
-fn parse_array(b: &[u8], mut pos: usize) -> Result<(Json, usize), String> {
+fn parse_array(b: &[u8], mut pos: usize, depth: u32) -> Result<(Json, usize), String> {
     pos += 1; // '['
     let mut items = Vec::new();
     pos = skip_ws(b, pos);
@@ -132,7 +172,7 @@ fn parse_array(b: &[u8], mut pos: usize) -> Result<(Json, usize), String> {
         return Ok((Json::Array(items), pos + 1));
     }
     loop {
-        let (value, next) = parse_value(b, pos)?;
+        let (value, next) = parse_value(b, pos, depth)?;
         items.push(value);
         pos = skip_ws(b, next);
         match b.get(pos) {
@@ -404,5 +444,169 @@ mod tests {
         // (`/releases`, не `/releases/latest`) — проверено вживую.
         let v = parse("[]").unwrap();
         assert_eq!(v.as_array(), Some(&[][..]));
+    }
+
+    // ---- Fix round 1 (задача 3): предел глубины и «враждебные» входы ----
+    //
+    // Вход сюда приходит из сети (`source::GithubSource`), поэтому не
+    // «правильный формат, который мы разбираем», а произвольные байты,
+    // которые обязаны либо разобраться, либо честно вернуть `Err` — и
+    // никогда не запаниковать и не переполнить стек. Переполнение стека
+    // здесь — это не «плохой тест», а `abort` без единого `Drop`, включая
+    // `RestoreOnDrop`, который единственный возвращает системный прокси на
+    // выходе процесса (докблок модуля выше и отчёт задачи).
+
+    #[test]
+    fn nesting_exactly_at_the_limit_still_parses() {
+        let opens = "[".repeat(MAX_DEPTH as usize);
+        let closes = "]".repeat(MAX_DEPTH as usize);
+        let doc = format!("{opens}{closes}");
+        assert!(parse(&doc).is_ok(), "ровно предел обязан разбираться");
+    }
+
+    #[test]
+    fn nesting_one_level_past_the_limit_is_a_clean_error() {
+        let opens = "[".repeat(MAX_DEPTH as usize + 1);
+        let closes = "]".repeat(MAX_DEPTH as usize + 1);
+        let doc = format!("{opens}{closes}");
+        assert!(
+            parse(&doc).is_err(),
+            "предел+1 обязан быть отклонён явной ошибкой"
+        );
+    }
+
+    #[test]
+    fn nesting_far_past_the_limit_is_rejected_not_a_stack_overflow() {
+        // На три порядка больше предела: если бы предела не существовало,
+        // это ровно тот вход, что кладёт процесс `abort`'ом в обход
+        // `RestoreOnDrop`. Тест проходит потому, что разбор отказывает
+        // задолго до того, как рекурсия успела бы куда-то дотянуться — а
+        // не потому, что процесс пережил переполнение (он бы не пережил).
+        let opens = "[".repeat(50_000);
+        assert!(parse(&opens).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_objects_are_bounded_the_same_way_as_arrays() {
+        // Предел общий на оба вида вложенности — `parse_value` считает
+        // глубину один раз для обоих, а не отдельно для `{` и для `[`.
+        let mut doc = String::new();
+        for i in 0..(MAX_DEPTH as usize + 5) {
+            doc.push_str(&format!("{{\"a{i}\":"));
+        }
+        doc.push_str("null");
+        for _ in 0..(MAX_DEPTH as usize + 5) {
+            doc.push('}');
+        }
+        assert!(parse(&doc).is_err());
+    }
+
+    #[test]
+    fn a_bare_minus_is_a_parse_error_not_a_panic() {
+        assert!(parse("-").is_err());
+    }
+
+    #[test]
+    fn a_lone_high_surrogate_does_not_panic() {
+        assert!(parse(r#""\ud800""#).is_ok(), "не должно паниковать");
+    }
+
+    #[test]
+    fn a_lone_low_surrogate_does_not_panic() {
+        assert!(parse(r#""\udc00""#).is_ok(), "не должно паниковать");
+    }
+
+    #[test]
+    fn a_truncated_unicode_escape_is_an_error_not_a_panic() {
+        assert!(parse("\"\\u12").is_err());
+        assert!(parse("\"\\u\"").is_err());
+        assert!(parse("\"\\uZZZZ\"").is_err());
+    }
+
+    #[test]
+    fn an_unknown_escape_is_an_error_not_a_panic() {
+        assert!(parse(r#""\q""#).is_err());
+    }
+
+    #[test]
+    fn a_trailing_backslash_is_an_error_not_a_panic() {
+        assert!(parse("\"a\\").is_err());
+    }
+
+    #[test]
+    fn an_absurdly_long_number_does_not_panic() {
+        let huge = "9".repeat(400);
+        assert!(parse(&huge).is_ok(), "переполнение f64 — не ошибка формата");
+    }
+
+    #[test]
+    fn truncations_of_a_valid_document_at_every_byte_offset_never_panic() {
+        // Строка целиком ASCII — каждый байтовый срез сам по себе валиден
+        // как UTF-8, поэтому обрезка на любом байте не падает на индексации
+        // ДО того, как вообще дойдёт до разбора; интересует именно разбор.
+        let full = r#"{"tag_name": "v1.2.3", "assets": [{"name": "proxypilot.exe", "browser_download_url": "https://example.internal/a.exe", "meta": {"a": [1,2,3], "b": "x\ny", "u": "\ud83d\ude00"}}], "n": -12.5e-2}"#;
+        assert!(full.is_ascii(), "тест полагается на срез по любому байту");
+        for i in 0..=full.len() {
+            let _ = parse(&full[..i]);
+        }
+    }
+
+    /// Крошечный детерминированный ГСЧ (xorshift64) — свой, а не крейт
+    /// `rand`: та же причина, по которой в этом файле нет `serde_json`
+    /// (сеть к `crates.io` за новой зависимостью недоступна в этой
+    /// песочнице, см. докблок модуля), плюс детерминированность даёт
+    /// воспроизводимый прогон без отдельного механизма сохранения seed.
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    #[test]
+    fn random_json_flavoured_byte_soup_never_panics_or_hangs() {
+        // Алфавит смещён в сторону синтаксиса JSON (скобки, кавычки,
+        // цифры, ключевые слова, escape-символы) — случайные ASCII-буквы
+        // почти всегда отвалились бы на первом же байте, а здесь генератор
+        // с большей вероятностью попадает в интересные пограничные
+        // состояния разбора (незакрытые строки, битые `\u`, обрубленные
+        // числа, несбалансированные скобки).
+        const ALPHABET: &[u8] = b"{}[]\":,truefalsenull0123456789.-eE \t\\/uU-+";
+        let mut rng = Xorshift64(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..5_000 {
+            let len = (rng.next() % 80) as usize;
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                let idx = (rng.next() as usize) % ALPHABET.len();
+                s.push(ALPHABET[idx] as char);
+            }
+            // Единственное, что здесь проверяется, — что вызов вообще
+            // вернулся (не запаниковал, не переполнил стек, не завис):
+            // конкретный Ok/Err для мусорного входа не имеет смысла.
+            let _ = parse(&s);
+        }
+    }
+
+    #[test]
+    fn random_byte_soup_outside_the_json_alphabet_never_panics() {
+        // Второй прогон с полным алфавитом печатных ASCII-байт (не только
+        // «похожих на JSON») — ловит то, что первый генератор мог не
+        // затронуть чисто по распределению символов.
+        let mut rng = Xorshift64(0x2545_F491_4F6C_DD1D);
+        for _ in 0..5_000 {
+            let len = (rng.next() % 80) as usize;
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                let byte = 0x20 + (rng.next() % 95) as u8; // печатный ASCII
+                s.push(byte as char);
+            }
+            let _ = parse(&s);
+        }
     }
 }
