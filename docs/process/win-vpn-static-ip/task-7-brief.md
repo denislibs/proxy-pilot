@@ -1,6 +1,6 @@
 # Task 7 — Сеть и туннель в интерфейсе
 
-**Files:** `win/crates/app/src/tray.rs`, `win/crates/app/src/settings_page.rs`, `win/crates/app/src/main.rs`
+**Files:** `crates/app/src/tray.rs`, `crates/app/src/settings_page.rs`, `crates/app/src/main.rs`
 
 **Produces:** секции сети и туннеля в меню трея и на странице настроек.
 

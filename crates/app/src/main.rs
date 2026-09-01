@@ -49,6 +49,7 @@ mod proxy;
 mod settings_page;
 mod tray;
 mod ui;
+mod update;
 mod websrv;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,10 +65,13 @@ use proxypilot_bridge::supervisor::{AppState, NetworkSource, Supervisor, Supervi
 use proxypilot_core::bypass::BypassList;
 use proxypilot_core::config::Config;
 use proxypilot_core::mode::{ConnectedNetwork, Mode, Route};
+use proxypilot_core::net::Ipv4Net;
 use proxypilot_winnet::autostart;
 use proxypilot_winnet::com::ComGuard;
 use proxypilot_winnet::events::{debounce, watch_network_changes};
 use proxypilot_winnet::networks::list_connected;
+use proxypilot_winnet::openvpn::{self, ProfileStatus};
+use proxypilot_winnet::{routes as ip_routes, tunnel_log, tunnel_state};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -127,6 +131,20 @@ const PROBE_TTL: Duration = Duration::from_secs(30);
 /// вызовы NLM. При 60 с каждый тик — свежая проба обоих апстримов.
 const REEVALUATE_PERIOD: Duration = Duration::from_secs(60);
 
+/// Как часто фоновая проверка спрашивает GitHub про новый релиз. Не на
+/// каждом старте и не каждую минуту: анонимные запросы к API ограничены по
+/// числу в час, а релизы происходят не каждый день — раз в сутки более чем
+/// достаточно для «неблокирующего фонового уведомления», которым эта
+/// проверка и является (задача 3).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Задержка первой проверки после старта. Не сразу: старт и так занят более
+/// срочными вещами (первый пересчёт маршрута, привязка слушателя,
+/// самопроверка), а сеть на проверку обновлений может быть недоступна ровно
+/// в момент старта — приёмка задачи 3 требует, чтобы это не задерживало и
+/// не портило впечатление о старте вовсе.
+const UPDATE_CHECK_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
+
 /// Что делать супервизору. Смена сети, смена режима и правка настроек
 /// сходятся в один канал: все три означают «пересчитай», и обрабатывать их
 /// порознь значило бы завести несколько мест, где пересчёт может разойтись.
@@ -164,9 +182,84 @@ enum Exit {
 }
 
 fn main() {
+    // `install-service`/`uninstall-service` — единственный запрос прав
+    // администратора во всём продукте (`CLAUDE.md`, «Права
+    // администратора»): регистрация службы `ProxyPilotNetProfile`,
+    // которая одна умеет менять IPv4-адрес. Явные, однократные,
+    // необязательные — кто их не вызвал, не увидит ни одного UAC.
+    // Разбираются раньше `run()`: это не запуск трея, а обычная короткая
+    // команда, которая обязана вернуть управление сразу же.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("install-service") => std::process::exit(run_install_service()),
+        Some("uninstall-service") => std::process::exit(run_uninstall_service()),
+        _ => {}
+    }
+
     if let Err(e) = run() {
         report_failure(&e);
         std::process::exit(1);
+    }
+}
+
+/// Путь к бинарнику самой службы — отдельный исполняемый файл
+/// (`proxypilot-netsvc.exe`), а не этот процесс: ядро (этот `.exe`)
+/// обязано остаться без единого запроса UAC, поэтому статика живёт в
+/// отдельной программе (`crates/netsvc`). Ставится рядом, в том же
+/// каталоге, куда установлен `proxypilot.exe` — оба поставляются вместе
+/// одним инсталлятором (`docs/design.md` §12).
+fn netsvc_exe_path() -> Result<std::path::PathBuf, String> {
+    let self_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = self_exe
+        .parent()
+        .ok_or("у пути к proxypilot.exe нет каталога")?;
+    Ok(dir.join("proxypilot-netsvc.exe"))
+}
+
+/// Возвращает код возврата процесса — 0 при успехе, 1 при отказе, с текстом
+/// отказа в stderr. Не паникует и не показывает `ui::error_box`: это
+/// команда для консоли (человек, поставивший её вручную, с правами
+/// администратора), а не для двойного щелчка по иконке.
+fn run_install_service() -> i32 {
+    match netsvc_exe_path()
+        .and_then(|p| proxypilot_netsvc::install::install(&p).map_err(|e| e.to_string()))
+    {
+        Ok(()) => {
+            println!(
+                "Служба {} зарегистрирована (автозапуск). Она ещё не запущена — \
+                 первый пуск сделает Windows при следующей перезагрузке, или \
+                 запустите её вручную: services.msc / Start-Service {}.",
+                proxypilot_netsvc::SERVICE_NAME,
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "Не удалось установить службу {}: {e}",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            1
+        }
+    }
+}
+
+fn run_uninstall_service() -> i32 {
+    match proxypilot_netsvc::install::uninstall() {
+        Ok(()) => {
+            println!(
+                "Служба {} снята с регистрации.",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "Не удалось удалить службу {}: {e}",
+                proxypilot_netsvc::SERVICE_NAME
+            );
+            1
+        }
     }
 }
 
@@ -225,6 +318,38 @@ fn run() -> Result<(), String> {
     // Ровно один вызов на процесс и как можно раньше: всё, что случится до
     // него, в файл не попадёт. Страж обязан дожить до конца `run`.
     let _log_guard = log::init(Some(&log_dir));
+
+    // Обновление, отложенное фоновой проверкой ПРОШЛОГО запуска
+    // (`update::check`), ставится на место здесь — ДО `Config::load`, ДО
+    // COM, ДО привязки слушателя моста. Это и есть «замена при следующем
+    // запуске, а не под работающим процессом» (`CLAUDE.md`,
+    // `docs/process/win-delivery/task-3-brief.md`): этот процесс ещё
+    // ничего не взял на себя — ни порт, ни системный прокси, — и если
+    // своп произошёл, он тут же перезапускает себя же и завершается, так
+    // и не тронув реестр. Подробности — докблок `update::install`.
+    if let Ok(exe) = std::env::current_exe() {
+        let update_dir = dir.join("update");
+        match update::install::apply_pending_update(
+            &update_dir,
+            &exe,
+            update::install::real_verifier,
+        ) {
+            Ok(true) => {
+                info!("отложенное обновление применено — перезапускаемся");
+                match update::install::relaunch(&exe) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => error!(
+                        error = %e,
+                        "не удалось перезапуститься после обновления — продолжаем со старой копией в памяти"
+                    ),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "отложенное обновление не применилось"),
+        }
+    } else {
+        warn!("не узнать свой путь — проверка отложенного обновления пропущена");
+    }
 
     let outcome = run_logged(&config_path);
     if let Err(e) = &outcome {
@@ -288,7 +413,14 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
     // ниже: страж завершения сеанса обязан встать ДО того, как реестр
     // укажет на нас, иначе останется зазор, в котором конец сеанса некому
     // будет перехватить.
-    let tray = Tray::new(&initial).map_err(|e| format!("трей: {e}"))?;
+    // Единственный экземпляр на весь процесс — тот же самый нужен и трею
+    // (снимок в заголовке меню), и каждому открытию страницы настроек
+    // (`SettingsState.tunnel`): без состояния, поэтому клонировать `Arc`,
+    // а не заводить второй, безопасно и дёшево.
+    let tunnel: Arc<dyn settings_page::Tunnel> = Arc::new(WinTunnel);
+    let initial_tunnel_snapshot =
+        tunnel.snapshot(&cfg.office_subnets, settings_page::TUNNEL_PROFILE_NAME);
+    let tray = Tray::new(&initial, &initial_tunnel_snapshot).map_err(|e| format!("трей: {e}"))?;
     tray.install_session_end_guard();
 
     // Страж и обработчик консоли ставятся ДО `take_over`, а не после.
@@ -377,6 +509,23 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
     spawn_network_watch(&runtime, commands.clone());
     spawn_periodic_reevaluate(&runtime, commands.clone());
 
+    // Итог последней фоновой проверки обновлений — читает страница настроек
+    // (`update_status_note`), пишет только задача, запущенная ниже.
+    // `None` — «ещё не проверялось», отдельно от «проверили и отказало»
+    // (см. докблок `settings_page::SettingsState::update_status`).
+    let update_status: Arc<ArcSwap<Option<update::check::CheckOutcome>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    if let Some(update_dir) = config_path.parent().map(|d| d.join("update")) {
+        spawn_update_check(
+            &runtime,
+            Arc::clone(&saved_config),
+            update_dir,
+            Arc::clone(&update_status),
+        );
+    } else {
+        warn!("нет каталога конфигурации — фоновая проверка обновлений не запущена");
+    }
+
     {
         let state = Arc::clone(&state);
         let saved_config = Arc::clone(&saved_config);
@@ -407,7 +556,7 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
                     Cmd::SetMode(mode) => Some(Change::Mode(mode)),
                     Cmd::ApplyConfig { config, done } => {
                         reply = Some(done);
-                        Some(Change::Whole(*config))
+                        Some(Change::Whole(config))
                     }
                 };
                 if let Some(change) = change {
@@ -440,7 +589,20 @@ fn run_logged(config_path: &std::path::Path) -> Result<(), String> {
         });
     }
 
-    match message_loop(&tray, &state, &saved_config, &commands, &runtime, port) {
+    // Собран здесь же, а не внутри `message_loop`: восьмым параметром
+    // (`update_status`, задача 3) собственный список аргументов функции
+    // перевалил бы за предел `clippy::too_many_arguments` (7) второй раз —
+    // тем же приёмом, каким уже собран `SettingsDeps` для `open_settings`.
+    let settings_deps = SettingsDeps {
+        runtime: &runtime,
+        state: &state,
+        saved_config: &saved_config,
+        commands: &commands,
+        bound_port: port,
+        tunnel: &tunnel,
+        update_status: &update_status,
+    };
+    match message_loop(&tray, &settings_deps) {
         Exit::User => {
             info!("выход по команде пользователя");
             Ok(())
@@ -521,7 +683,13 @@ enum Change {
     /// Переключение режима из трея — одно поле.
     Mode(Mode),
     /// Форма страницы настроек прислала конфиг целиком.
-    Whole(Config),
+    ///
+    /// `Box`, тем же приёмом, что и `Cmd::ApplyConfig` рядом: задача 5
+    /// добавила в `Config` `office_subnets`, `net_profile` и тумблер
+    /// автоматики туннеля, и вариант без коробки стал заметно крупнее
+    /// `Mode` — тот самый `large_enum_variant`, который здесь уже когда-то
+    /// решили боксом, а не `#[allow(...)]` (запрещён CLAUDE.md).
+    Whole(Box<Config>),
 }
 
 /// Применяет изменение к сохранённому конфигу и отдаёт ЖИВОЙ — тот, с
@@ -549,7 +717,7 @@ enum Change {
 fn apply_change(saved: &mut Config, change: Change, bound_port: u16) -> Config {
     match change {
         Change::Mode(mode) => saved.mode = mode,
-        Change::Whole(next) => *saved = next,
+        Change::Whole(next) => *saved = *next,
     }
     settings_page::live_config(saved, bound_port)
 }
@@ -625,6 +793,52 @@ fn spawn_periodic_reevaluate(runtime: &tokio::runtime::Runtime, commands: mpsc::
     });
 }
 
+/// Фоновая проверка обновлений (план 5, задача 3).
+///
+/// **Не блокирует старт**: заводится через `runtime.spawn`, а не
+/// `block_on`, и сама функция вызывается не отсюда напрямую, а из тела
+/// заведённой задачи — то есть первая проверка происходит не раньше, чем
+/// истечёт `UPDATE_CHECK_INITIAL_DELAY` уже ПОСЛЕ того, как привязан
+/// слушатель, поднят трей и запущена самопроверка. `update::check::run`
+/// сама оборачивает сетевую работу таймаутом, так что зависшая сеть роняет
+/// одну проверку, а не поток целиком.
+///
+/// Тумблер (`cfg.check_for_updates`) читается заново на каждом тике из
+/// `saved_config`, а не один раз при запуске задачи: человек мог выключить
+/// проверку уже после старта, и следующий же тик обязан это увидеть, а не
+/// продолжать спрашивать сеть по инерции.
+fn spawn_update_check(
+    runtime: &tokio::runtime::Runtime,
+    saved_config: Arc<ArcSwap<Config>>,
+    update_dir: std::path::PathBuf,
+    status: Arc<ArcSwap<Option<update::check::CheckOutcome>>>,
+) {
+    let source: Arc<dyn update::source::UpdateSource> =
+        Arc::new(update::source::GithubSource::default());
+    runtime.spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + UPDATE_CHECK_INITIAL_DELAY,
+            UPDATE_CHECK_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let enabled = saved_config.load().check_for_updates;
+            let outcome = update::check::run(
+                env!("CARGO_PKG_VERSION").to_string(),
+                enabled,
+                Arc::clone(&source),
+                update_dir.clone(),
+                update::install::real_verifier,
+                update::check::DEFAULT_TIMEOUT,
+            )
+            .await;
+            info!(?outcome, "проверка обновлений завершена");
+            status.store(Arc::new(Some(outcome)));
+        }
+    });
+}
+
 /// Список подключённых сетей через NLM.
 ///
 /// Реализация трейта живёт здесь, а не в мосте: мост обязан оставаться
@@ -683,6 +897,209 @@ impl settings_page::Autostart for WinAutostart {
     }
 }
 
+/// Имя файла, откуда «Собрать профиль» берёт исходный `.ovpn` (сертификаты,
+/// адрес сервера — то, что выдаёт офисный администратор), под именем,
+/// которое не совпадёт ни с одним профилем пользователя и ни с нашим
+/// собственным выходом (`TUNNEL_PROFILE_NAME`, `settings_page.rs`).
+///
+/// Ищется через `openvpn::find_config_file` в ОБОИХ каталогах конфигураций
+/// — `Installation::user_config_dir` (куда обычный пользователь способен
+/// положить файл сам, без UAC — именно туда стоит класть его по умолчанию)
+/// и `Installation::config_dir` (системный, куда мог заранее положить файл
+/// администратор при установке). Кладётся сам файл пользователем вручную,
+/// не этим кодом — сюда он только читается.
+///
+/// Больше нигде в проекте это имя не специфицировано: ни один из планов
+/// 1-6 не назвал источник `ovpn_profile::build_profile`, а первым реальным
+/// вызывающим стала именно эта задача — см. отчёт задачи 7.
+const TUNNEL_SOURCE_FILE: &str = "proxypilot-source.ovpn";
+
+/// Реализация [`settings_page::Tunnel`] поверх `proxypilot_winnet`.
+///
+/// Без состояния: каждый вызов заново читает систему (`find_installation`,
+/// `profile_status`, живую таблицу маршрутов) — тот же принцип, что и у
+/// `openvpn.rs` (`ensure_still_installed` на каждом вызове, а не однажды
+/// найденный `Installation`, который могли снести между поиском и
+/// использованием).
+struct WinTunnel;
+
+impl WinTunnel {
+    /// Живой список адаптеров-маршрутов для `tunnel_state`, с честным
+    /// признаком отказа чтения — `snapshot` обязана СКАЗАТЬ, что не смогла
+    /// проверить чужой туннель, а не тихо посчитать, что его нет.
+    fn adapters() -> Result<Vec<tunnel_state::AdapterRoute>, String> {
+        ip_routes::gather_ipv4_routes().map_err(|e| e.to_string())
+    }
+}
+
+impl settings_page::Tunnel for WinTunnel {
+    fn snapshot(
+        &self,
+        office_subnets: &[Ipv4Net],
+        profile_name: &str,
+    ) -> settings_page::TunnelSnapshot {
+        let Ok(Some(inst)) = openvpn::find_installation() else {
+            return settings_page::TunnelSnapshot::default();
+        };
+        let profile_installed = matches!(
+            openvpn::profile_status(&inst, profile_name),
+            Ok(ProfileStatus::Installed)
+        );
+
+        // Живость — по логу openvpn-gui.exe для нашего профиля
+        // (`tunnel_log::liveness`), НЕ по имени адаптера: fix round 1
+        // задачи 7 нашёл, что реальные адаптеры называются по драйверу
+        // («OpenVPN Wintun», «TAP-Windows Adapter V9»), никогда — по имени
+        // соединения.
+        let log_up = tunnel_log::liveness(profile_name)
+            .map(|live| live == tunnel_log::TunnelLiveness::Up)
+            .map_err(|e| e.to_string());
+
+        // Несёт ли ХОТЬ ОДИН туннельный адаптер наши подсети — round 2
+        // задачи 7 убрал alias отсюда целиком (`tunnel_state::any_tunnel_carries`
+        // больше не пытается решить, чей это адаптер).
+        let carries = Self::adapters()
+            .map(|adapters| tunnel_state::any_tunnel_carries(office_subnets, &adapters));
+
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(log_up, carries);
+
+        settings_page::TunnelSnapshot {
+            installed: true,
+            profile_installed,
+            our_tunnel_up,
+            rising,
+            liveness_error,
+            foreign_tunnel_up,
+            routes_error,
+        }
+    }
+
+    fn build_profile(&self, profile_name: &str, office_subnets: &[Ipv4Net]) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        // Источник ищется в обоих каталогах конфигураций (докблок
+        // TUNNEL_SOURCE_FILE), предпочитая пользовательский; если файла нет
+        // ни там, ни там — путь в сообщении об ошибке указывает именно на
+        // пользовательский каталог, потому что это единственное место, куда
+        // обычный пользователь способен его положить сам.
+        let source_path = openvpn::find_config_file(&inst, TUNNEL_SOURCE_FILE)
+            .unwrap_or_else(|| inst.user_config_dir.join(TUNNEL_SOURCE_FILE));
+        let source = std::fs::read_to_string(&source_path).map_err(|e| {
+            format!(
+                "не найден файл источника {}: {e}. Положите свой .ovpn \
+                 (сертификаты, адрес сервера — то, что выдал администратор) \
+                 туда под этим именем и нажмите «Собрать профиль» ещё раз.",
+                source_path.display()
+            )
+        })?;
+        openvpn::build_and_install_profile(&inst, profile_name, &source, office_subnets)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn raise(&self, profile_name: &str) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        openvpn::connect(&inst, profile_name).map_err(|e| e.to_string())
+    }
+
+    fn lower(&self, profile_name: &str) -> Result<(), String> {
+        let inst = openvpn::find_installation()
+            .map_err(|e| e.to_string())?
+            .ok_or("OpenVPN не найден")?;
+        openvpn::disconnect(&inst, profile_name).map_err(|e| e.to_string())
+    }
+
+    fn install_service(&self) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        ui::request_elevation(&exe, "install-service")
+    }
+}
+
+/// Сводит два независимых источника («лог считает поднятым?», «несёт ли
+/// хоть один туннельный адаптер наши подсети?») в пять полей
+/// `TunnelSnapshot` — чистая функция ради теста, отдельно от чтения лога
+/// и таблицы маршрутов (`WinTunnel::snapshot` выше).
+///
+/// Round 2 задачи 7: `our_tunnel_up` требует ПОДТВЕРЖДЕНИЯ ОБОИХ
+/// источников разом, а не одного лога — иначе `openvpn.exe`, убитый без
+/// штатного выхода, продолжал бы читаться как «поднят» сколько угодно
+/// долго (докблок `winnet::tunnel_log`, «Честные пределы»).
+/// `foreign_tunnel_up` — что маршруты заняты, а лог НЕ подтверждает, что
+/// это мы. Возврат: `(our_tunnel_up, rising, foreign_tunnel_up,
+/// liveness_error, routes_error)`.
+///
+/// Два источника ошибок остаются независимыми (см. докблок
+/// `settings_page::TunnelSnapshot`): отказ прочитать маршруты не должен
+/// стирать то, что честно сказал лог, и наоборот. Особый случай — лог
+/// говорит «поднято», а маршруты прочитать не удалось: подтвердить
+/// подъём НЕЧЕМ (весь смысл требовать оба источника — не верить логу в
+/// одиночку), поэтому это тоже «не знаю», а не «поднято на слово лога».
+fn combine_tunnel_facts(
+    log_up: Result<bool, String>,
+    carries: Result<bool, String>,
+) -> (bool, bool, bool, Option<String>, Option<String>) {
+    match (log_up, carries) {
+        (Ok(true), Ok(true)) => (true, false, false, None, None),
+        // «Поднимается»: лог уже увидел успешное подключение, но
+        // маршруты профиля (`route ...` из собранного `.ovpn`) ещё не
+        // встали — короткое окно сразу после «Поднять туннель».
+        (Ok(true), Ok(false)) => (false, true, false, None, None),
+        (Ok(false), Ok(true)) => (false, false, true, None, None),
+        (Ok(false), Ok(false)) => (false, false, false, None, None),
+        // Лог точно говорит «не поднято» — про `our_tunnel_up` сказано
+        // всё, что нужно, без участия маршрутов. Отказ читать маршруты
+        // означает только «не проверить, свободны ли они для подъёма».
+        (Ok(false), Err(e)) => (false, false, false, None, Some(e)),
+        // Лог говорит «поднято», но подтвердить нечем — не верим логу в
+        // одиночку (в этом и была цель объединения), и не притворяемся,
+        // что знаем больше маршрутов.
+        (Ok(true), Err(e)) => (
+            false,
+            false,
+            false,
+            Some(format!(
+                "лог утверждает, что туннель поднят, но подтвердить это \
+                 таблицей маршрутов не удалось: {e}"
+            )),
+            None,
+        ),
+        // Лог недоступен целиком — по этой же причине не подтвердить
+        // `our_tunnel_up`, и по той же причине не утверждать
+        // `foreign_tunnel_up`: маршруты МОГУТ быть заняты нашим же
+        // туннелем, который мы просто не можем подтвердить логом
+        // (регрессия round 2 — см. тест
+        // `an_unreadable_log_does_not_call_our_own_tunnel_someone_elses`).
+        (Err(e), Ok(_)) => (false, false, false, Some(e), None),
+        (Err(e1), Err(e2)) => (
+            false,
+            false,
+            false,
+            Some(format!("{e1}; и таблица маршрутов тоже не читается: {e2}")),
+            None,
+        ),
+    }
+}
+
+/// Общая часть, которую `open_settings` собирает в `SettingsState` заново
+/// при каждом открытии страницы — все шесть значений всегда идут вместе, и
+/// ни один вызывающий (`message_loop`) не передаёт их по отдельности.
+struct SettingsDeps<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    state: &'a Arc<ArcSwap<AppState>>,
+    saved_config: &'a Arc<ArcSwap<Config>>,
+    commands: &'a mpsc::Sender<Cmd>,
+    bound_port: u16,
+    tunnel: &'a Arc<dyn settings_page::Tunnel>,
+    /// Итог последней фоновой проверки обновлений (задача 3) — та же
+    /// ячейка, что пишет `spawn_update_check`, а не копия: странице и
+    /// заведённой задаче незачем расходиться в том, что показывать.
+    update_status: &'a Arc<ArcSwap<Option<update::check::CheckOutcome>>>,
+}
+
 /// Открывает страницу настроек: поднимает сервер, если его нет, и зовёт
 /// браузер.
 ///
@@ -701,34 +1118,34 @@ impl settings_page::Autostart for WinAutostart {
 ///
 /// Отказ не смертелен — приложение продолжает работать, — но и молчать о
 /// нём нельзя: человек нажал пункт меню и ждёт окна.
-fn open_settings(
-    runtime: &tokio::runtime::Runtime,
-    state: &Arc<ArcSwap<AppState>>,
-    saved_config: &Arc<ArcSwap<Config>>,
-    commands: &mpsc::Sender<Cmd>,
-    bound_port: u16,
-    server: &mut Option<websrv::Server>,
-    section: Option<&str>,
-) {
+///
+/// Параметры собраны в [`SettingsDeps`], а не переданы по отдельности:
+/// добавление `tunnel` (задача 7) перевалило их число за предел
+/// `clippy::too_many_arguments` (7) — не обход находки, а обычная
+/// группировка: все шесть всегда идут вместе, ни один вызывающий не
+/// передаёт их по отдельности.
+fn open_settings(deps: &SettingsDeps, server: &mut Option<websrv::Server>, section: Option<&str>) {
     if !server.as_ref().is_some_and(|s| s.is_running()) {
         let shared = Arc::new(settings_page::SettingsState {
             // Та же ячейка, что читает трей, а не копия: разойдись они —
             // и меню со страницей показывали бы разное состояние.
-            app: Arc::clone(state),
-            config: Arc::clone(saved_config),
+            app: Arc::clone(deps.state),
+            config: Arc::clone(deps.saved_config),
             // Единственный путь применить изменение — тот же канал, которым
             // ходят трей и подписка на смену сети.
-            commands: commands.clone(),
+            commands: deps.commands.clone(),
             // Порт, на котором слушатель уже привязан. Страница обязана
             // знать именно его, а не то, что записано в конфиге: разойтись
             // они могут ровно на одну правку — ту, что требует перезапуска.
-            bound_port,
+            bound_port: deps.bound_port,
             autostart: Arc::new(WinAutostart),
+            tunnel: Arc::clone(deps.tunnel),
+            update_status: Arc::clone(deps.update_status),
         });
         // `block_on` с главного потока безопасен: он не внутри рантайма, а
         // сама привязка слушателя занимает микросекунды — цикл сообщений
         // этого не заметит.
-        match runtime.block_on(websrv::Server::start(shared)) {
+        match deps.runtime.block_on(websrv::Server::start(shared)) {
             Ok(s) => {
                 server.replace(s);
             }
@@ -769,14 +1186,7 @@ fn open_settings(
 
 /// Цикл сообщений главного потока. Без него не работает ни иконка, ни меню:
 /// оболочка общается с ними оконными сообщениями.
-fn message_loop(
-    tray: &Tray,
-    state: &Arc<ArcSwap<AppState>>,
-    saved_config: &Arc<ArcSwap<Config>>,
-    commands: &mpsc::Sender<Cmd>,
-    runtime: &tokio::runtime::Runtime,
-    bound_port: u16,
-) -> Exit {
+fn message_loop(tray: &Tray, deps: &SettingsDeps) -> Exit {
     let mut msg = MSG::default();
     // Сервер настроек живёт ровно столько, сколько живёт эта переменная:
     // выход из цикла — любой из четырёх — уничтожает её вместе с дверью.
@@ -811,8 +1221,16 @@ fn message_loop(
             return Exit::BridgeStopped;
         }
         if msg.message == WM_STATE_CHANGED {
-            let snapshot = state.load();
-            tray.refresh(&snapshot);
+            let snapshot = deps.state.load();
+            // Живой снимок туннеля — те же чтения (реестр, файловая
+            // система, таблица маршрутов), что и на странице настроек, тут
+            // же на главном потоке: все они быстрые локальные вызовы без
+            // сети, тем же приёмом, что и `icon_for`/`network_text` рядом.
+            let tunnel_snapshot = deps.tunnel.snapshot(
+                &deps.saved_config.load().office_subnets,
+                settings_page::TUNNEL_PROFILE_NAME,
+            );
+            tray.refresh(&snapshot, &tunnel_snapshot);
         }
 
         // SAFETY: `msg` заполнена успешным `GetMessageW` и не изменялась.
@@ -834,39 +1252,16 @@ fn message_loop(
             match tray.action_for(event.id()) {
                 Some(Action::Quit) => return Exit::User,
                 Some(Action::CopyAddress) => tray.copy_address(),
-                Some(Action::OpenSettings) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    None,
-                ),
-                Some(Action::OpenBench) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    Some("bench"),
-                ),
-                Some(Action::OpenDoctor) => open_settings(
-                    runtime,
-                    state,
-                    saved_config,
-                    commands,
-                    bound_port,
-                    &mut settings,
-                    Some("doctor"),
-                ),
+                Some(Action::OpenSettings) => open_settings(deps, &mut settings, None),
+                Some(Action::OpenBench) => open_settings(deps, &mut settings, Some("bench")),
+                Some(Action::OpenDoctor) => open_settings(deps, &mut settings, Some("doctor")),
+                Some(Action::OpenTunnel) => open_settings(deps, &mut settings, Some("tunnel")),
                 Some(Action::SetMode(mode)) => {
                     // `try_send`, а не `blocking_send`: главный поток обязан
                     // вернуться в цикл сообщений — застрявший цикл выглядит
                     // как зависшая система, а очередь на 16 команд от кликов
                     // мышью переполниться не может.
-                    if let Err(e) = commands.try_send(Cmd::SetMode(mode)) {
+                    if let Err(e) = deps.commands.try_send(Cmd::SetMode(mode)) {
                         warn!(error = %e, ?mode, "команда смены режима не доставлена");
                     }
                 }
@@ -924,6 +1319,132 @@ mod tests {
     use super::*;
     use proxypilot_core::config::OfficeNetwork;
 
+    // ---- Задача 7, fix round 2: combine_tunnel_facts ----
+
+    #[test]
+    fn both_sources_confirm_up() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(true), Ok(true)),
+            (true, false, false, None, None)
+        );
+    }
+
+    #[test]
+    fn log_up_but_routes_not_installed_yet_is_rising_not_alarming() {
+        // Round 2: короткое окно сразу после «Поднять туннель» —
+        // лог уже видел успех, маршруты профиля ещё не встали. Не «не
+        // поднят» (это выглядело бы как «нажмите снова») и не «поднят»
+        // (маршруты ещё не доказали это) — отдельное честное состояние.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(true), Ok(false));
+        assert!(!our_tunnel_up);
+        assert!(rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_none());
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn routes_carried_but_log_says_not_up_is_foreign() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(false), Ok(true)),
+            (false, false, true, None, None)
+        );
+    }
+
+    #[test]
+    fn neither_source_reports_anything_is_plain_down() {
+        assert_eq!(
+            combine_tunnel_facts(Ok(false), Ok(false)),
+            (false, false, false, None, None)
+        );
+    }
+
+    #[test]
+    fn a_hard_killed_process_stops_claiming_up_once_routes_disappear() {
+        // Ровно сценарий, ради которого round 2 затеян: openvpn.exe убит
+        // без штатного выхода — лог (в одиночку) продолжал бы врать
+        // «поднято», но маршруты уходят с процессом почти сразу.
+        // combine_tunnel_facts обязана погасить our_tunnel_up, а не
+        // поверить логу на слово.
+        let (our_tunnel_up, ..) = combine_tunnel_facts(Ok(true), Ok(false));
+        assert!(!our_tunnel_up, "лог в одиночку не должен решать «поднято»");
+    }
+
+    #[test]
+    fn routes_unreadable_while_log_says_down_blocks_only_the_raise_reason() {
+        // Лог уверенно говорит «не поднято» — про our_tunnel_up вопросов
+        // нет без всякого участия маршрутов. Отказ читать маршруты сюда
+        // не просачивается как liveness_error.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(false), Err("тестовый отказ".to_string()));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_none());
+        assert_eq!(routes_error.as_deref(), Some("тестовый отказ"));
+    }
+
+    #[test]
+    fn log_says_up_but_routes_cannot_confirm_it_is_reported_as_unknown() {
+        // «Поднято» на одно лишь слово лога, без маршрутов, подтвердить
+        // нечем — ровно то доверие логу в одиночку, ради устранения
+        // которого и введено объединение. Не «поднято», а «не знаю».
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Ok(true), Err("тестовый отказ".to_string()));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_some());
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_log_does_not_call_our_own_tunnel_someone_elses() {
+        // Регрессия, которая мотивировала round 2: лог нечитаем, а
+        // какой-то туннельный адаптер несёт наши подсети (возможно, это
+        // как раз наш собственный, только что поднятый, туннель — узнать
+        // логом сейчас нельзя). Страница обязана сказать «не знаю», а не
+        // «занято чужим» — до этого исправления `foreign_tunnel_up`
+        // строилась бы по alias'у адаптера и ошибочно утверждала бы
+        // именно это.
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, routes_error) =
+            combine_tunnel_facts(Err("тестовый отказ чтения лога".to_string()), Ok(true));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(
+            !foreign_tunnel_up,
+            "неизвестность лога не обязана превращаться в «занято чужим»"
+        );
+        assert_eq!(
+            liveness_error.as_deref(),
+            Some("тестовый отказ чтения лога")
+        );
+        assert!(routes_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_log_stays_unknown_even_when_routes_are_free() {
+        let (our_tunnel_up, rising, foreign_tunnel_up, liveness_error, _) =
+            combine_tunnel_facts(Err("тестовый отказ".to_string()), Ok(false));
+        assert!(!our_tunnel_up);
+        assert!(!rising);
+        assert!(!foreign_tunnel_up);
+        assert!(liveness_error.is_some());
+    }
+
+    #[test]
+    fn both_sources_failing_mentions_both_errors() {
+        let (.., liveness_error, routes_error) = combine_tunnel_facts(
+            Err("отказ лога".to_string()),
+            Err("отказ маршрутов".to_string()),
+        );
+        let msg = liveness_error.expect("оба отказа обязаны быть сообщены");
+        assert!(msg.contains("отказ лога"), "получили: {msg}");
+        assert!(msg.contains("отказ маршрутов"), "получили: {msg}");
+        assert!(routes_error.is_none());
+    }
+
     /// Порт, на котором слушатель привязан в этих тестах, и порт, который
     /// «вводит человек». Разные намеренно: совпади они — тесты не различали
     /// бы соблюдение правила и его отсутствие.
@@ -942,10 +1463,10 @@ mod tests {
         };
         let live = apply_change(
             &mut saved,
-            Change::Whole(Config {
+            Change::Whole(Box::new(Config {
                 bridge_port: REQUESTED,
                 ..Config::default()
-            }),
+            })),
             BOUND,
         );
         assert_eq!(
@@ -968,7 +1489,7 @@ mod tests {
         };
         let live = apply_change(
             &mut saved,
-            Change::Whole(Config {
+            Change::Whole(Box::new(Config {
                 bridge_port: REQUESTED,
                 socks_upstream: Some("203.0.113.10:9999".into()),
                 office_networks: vec![OfficeNetwork {
@@ -976,7 +1497,7 @@ mod tests {
                     name: "Офис".into(),
                 }],
                 ..Config::default()
-            }),
+            })),
             BOUND,
         );
         assert_eq!(live.socks_upstream.as_deref(), Some("203.0.113.10:9999"));

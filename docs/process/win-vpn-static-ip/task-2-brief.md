@@ -1,6 +1,6 @@
 # Task 2 — Сборка split-tunnel профиля
 
-**Files:** `win/crates/core/src/net.rs` (новый), `win/crates/core/src/lib.rs`, `win/crates/winnet/src/ovpn_profile.rs` (новый), `win/crates/winnet/src/lib.rs`
+**Files:** `crates/core/src/net.rs` (новый), `crates/core/src/lib.rs`, `crates/winnet/src/ovpn_profile.rs` (новый), `crates/winnet/src/lib.rs`
 
 **Produces:**
 ```rust

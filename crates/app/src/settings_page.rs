@@ -46,10 +46,12 @@ use proxypilot_bridge::bench::{bench_all, fastest, BenchResult};
 use proxypilot_bridge::supervisor::AppState;
 use proxypilot_core::config::{Config, OfficeNetwork};
 use proxypilot_core::mode::{Mode, Reachability, Route};
+use proxypilot_core::net::Ipv4Net;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::doctor::{self, Check, CheckStatus};
+use crate::update::check::CheckOutcome;
 use crate::Cmd;
 
 /// Что качаем при замере и сколько.
@@ -75,6 +77,151 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Сколько ждём ответа от собственного порта при живой диагностике.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Имя нашего профиля в OpenVPN — то же значение, что уходит и в имя файла
+/// (`<name>.ovpn`, `winnet::openvpn::install_profile`), и в
+/// `--command connect|disconnect <name>` (`docs/design.md` §8.3), и в
+/// `winnet::tunnel_log::liveness(name)` — имя файла лога `<name>.log`,
+/// который сам `openvpn-gui.exe` ведёт для этого подключения.
+///
+/// **Fix round 1, задача 7.** Первая версия этой константы подставлялась
+/// ещё и как `our_alias` в `tunnel_state::{our_tunnel_up,
+/// foreign_tunnel_up}` — псевдоним сетевого АДАПТЕРА. Это было неверно по
+/// факту, не только по осторожности: реальные адаптеры OpenVPN на Windows
+/// называются по драйверу («OpenVPN Wintun», «TAP-Windows Adapter V9»), а
+/// не по имени соединения, и ни один из них никогда не совпал бы со
+/// строкой ниже — подтверждено чтением `Get-NetAdapter` на живой машине,
+/// не по памяти. Из-за этого `our_tunnel_up` не срабатывала никогда, а
+/// `foreign_tunnel_up` классифицировала НАШ ЖЕ поднятый туннель как
+/// чужой — правило «не трогать чужой туннель» запрещало и подъём, и
+/// опускание разом, то есть ровно тот дедлок, ради устранения которого
+/// задача 3 и писала `same_alias`. Живость теперь определяет
+/// `winnet::tunnel_log` по логу, ключуемому этим же именем — тем, чем мы
+/// на самом деле владеем, — а не по имени адаптера, которым не владеем
+/// (см. докблок `tunnel_log`).
+///
+/// **Fix round 2, задача 7.** Round 1 оставил имя адаптера работать
+/// наполовину — в `foreign_tunnel_up`, пока `our_tunnel_up == false`.
+/// Ревью заметило: раз оно доказанно ничего не отличает, держать его
+/// хоть где-то — держать то же неверное основание. Убрано отовсюду:
+/// `tunnel_state::any_tunnel_carries` больше не видит и не принимает
+/// никакого алиаса, а `our_tunnel_up`/`foreign_tunnel_up` строятся у
+/// вызывающего (`WinTunnel::snapshot`, `main.rs`) из связки «что говорит
+/// лог» + «несёт ли хоть один туннельный адаптер наши подсети», без
+/// участия имени адаптера вовсе.
+pub const TUNNEL_PROFILE_NAME: &str = "proxypilot-office";
+
+/// Доступ к OpenVPN-туннелю и к установке службы статического IP с точки
+/// зрения страницы настроек.
+///
+/// Реальная реализация (`WinTunnel` в `main.rs`) вызывает
+/// `proxypilot_winnet::{openvpn, routes, tunnel_log, tunnel_state}` и
+/// `ShellExecuteW` с verb `runas` для установки службы. Тестовая
+/// (`FakeTunnel`, ниже) отдаёт заранее заданный снимок и ничего не
+/// трогает — ни диск, ни реестр, ни `openvpn-gui.exe`. Абстракция
+/// обязательна, не по вкусу: если бы тесты этой страницы звали настоящую
+/// реализацию, `cargo test` на машине, где OpenVPN установлен (а он
+/// установлен на машине, где велась эта сессия — см. отчёт задачи 1),
+/// реально запускал бы `openvpn-gui.exe --command connect`, писал файлы в
+/// каталог конфигураций OpenVPN и мог бы попытаться повысить права —
+/// ровно то, что `CLAUDE.md` запрещает агенту делать на этой машине.
+pub trait Tunnel: Send + Sync {
+    /// Снимок состояния — только чтение (реестр, файловая система, лог
+    /// `openvpn-gui.exe`, живая таблица маршрутов), безопасно вызывать
+    /// когда угодно и как угодно часто.
+    fn snapshot(&self, office_subnets: &[Ipv4Net], profile_name: &str) -> TunnelSnapshot;
+    /// Собирает split-tunnel профиль (`ovpn_profile::build_profile`,
+    /// ошибка которого не проглатывается — доходит до пользователя как
+    /// есть) и кладёт его в каталог конфигураций OpenVPN
+    /// (`openvpn::build_and_install_profile` →
+    /// `openvpn::Installation::user_config_dir`). Прав администратора не
+    /// требует — но НЕ потому, что каталог конфигураций OpenVPN в целом
+    /// доступен на запись обычному пользователю: это неверно для
+    /// СИСТЕМНОГО каталога (`Installation::config_dir`, на обычной
+    /// установке — под `Program Files`, запись туда отказывает access
+    /// denied без прав администратора, проверено на живой машине). Запись
+    /// идёт в ДРУГОЙ каталог — `Installation::user_config_dir`
+    /// (`%USERPROFILE%\OpenVPN\config`) — именно туда сам OpenVPN GUI и
+    /// сохраняет профили без UAC; он же показывает профили из обоих
+    /// каталогов разом, поэтому наш профиль в пользовательском каталоге
+    /// виден в GUI наравне с системными.
+    fn build_profile(&self, profile_name: &str, office_subnets: &[Ipv4Net]) -> Result<(), String>;
+    /// `Ok` значит только «команда передана `openvpn-gui.exe`», не «туннель
+    /// поднят» — тот же контракт, что у `openvpn::connect`.
+    fn raise(&self, profile_name: &str) -> Result<(), String>;
+    fn lower(&self, profile_name: &str) -> Result<(), String>;
+    /// Запускает `<этот же .exe> install-service` с запросом повышения прав
+    /// (`ShellExecuteW`, verb `runas`) — единственный путь к UAC во всём
+    /// приложении (`CLAUDE.md`, «Права администратора»). `Ok` значит только
+    /// «запрос ушёл в Windows», не «служба установлена»: принять/отклонить
+    /// диалог UAC и саму регистрацию видит уже не эта функция.
+    fn install_service(&self) -> Result<(), String>;
+}
+
+/// Что странице нужно знать об OpenVPN-туннеле для отрисовки. Не то же
+/// самое, что `openvpn::ProfileStatus` — тот отвечает «есть ли файл
+/// профиля на диске», а не «поднят ли туннель» (докблок `ProfileStatus`);
+/// здесь оба факта разложены по разным полям намеренно, чтобы не повторить
+/// ту же путаницу, ради которой `ProfileStatus` был переименован из
+/// `TunnelStatus`.
+///
+/// Два независимых источника, две независимые ошибки. `our_tunnel_up`
+/// (лог `openvpn-gui.exe`, ключ — имя профиля, которым мы владеем) и
+/// `foreign_tunnel_up` (таблица маршрутов + псевдоним адаптера, которым
+/// мы НЕ владеем — задача 3 и fix round 1 задачи 7) отвечают на разные
+/// вопросы и могут отказать порознь. `foreign_tunnel_up` вдобавок
+/// осмысленна ТОЛЬКО пока `our_tunnel_up == false` — устройство приоритета
+/// у [`tunnel_section`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelSnapshot {
+    /// OpenVPN не найден на машине вовсе — прочие поля смысла не имеют,
+    /// раздел неактивен целиком.
+    pub installed: bool,
+    /// Файл `<profile_name>.ovpn` есть в каталоге конфигураций OpenVPN.
+    pub profile_installed: bool,
+    /// **Round 2 задачи 7.** Требует подтверждения ОБОИХ независимых
+    /// источников разом: `winnet::tunnel_log::liveness(profile_name) ==
+    /// Up` (лог `openvpn-gui.exe`, ключ — имя профиля) И
+    /// `tunnel_state::any_tunnel_carries` (хоть один туннельный адаптер
+    /// несёт наши офисные подсети — без всякой привязки к тому, чей это
+    /// адаптер: round 1 доказал, что имя адаптера никогда не совпадает с
+    /// именем профиля, и round 2 убрал эту привязку отовсюду). Один лог
+    /// был недостаточен: `openvpn.exe`, убитый без штатного выхода
+    /// (`taskkill /F`), продолжал бы врать «поднято» сколько угодно —
+    /// маршруты в этот момент уже исчезли и гасят ложный `true` (докблок
+    /// `winnet::tunnel_log`, «Честные пределы»).
+    pub our_tunnel_up: bool,
+    /// Лог подтвердил успешное подключение, но ни один адаптер ещё не
+    /// несёт наши подсети — короткое окно сразу после «Поднять туннель»,
+    /// пока `route ...` из профиля не встали. Не «опущен» (это выглядело
+    /// бы как приглашение нажать «Поднять» ещё раз) — отдельное честное
+    /// состояние.
+    pub rising: bool,
+    /// Не удалось прочитать лог, чтобы решить `our_tunnel_up` честно, ЛИБО
+    /// лог сказал «поднято», а таблицу маршрутов прочитать не удалось,
+    /// чтобы это подтвердить (round 2: логу в одиночку теперь не верим —
+    /// значит и в этом случае ответ «не знаю», не «поднято на слово
+    /// лога»). `Some` не гасит кнопки, а замещает их предупреждением:
+    /// раздел, признающий «не знаю», лучше раздела, который молча
+    /// блокирует обе кнопки (дедлок, найденный в round 1).
+    pub liveness_error: Option<String>,
+    /// Живая таблица маршрутов несёт наши подсети, а лог НЕ подтверждает,
+    /// что это мы (round 2: раньше это называлось «чужой туннель» и
+    /// решалось по алиасу адаптера — round 1 показал, что алиас никогда
+    /// не совпадает, а round 2 убрал его из решения вовсе). Смысл у поля
+    /// только пока `our_tunnel_up == false` и `liveness_error == None`:
+    /// предупредить ДО подъёма, что подсети уже кем-то заняты — своим ли
+    /// забытым «хвостом» или правда чужим VPN, различить нельзя, поэтому
+    /// текст говорит «занято», не утверждая, чьё.
+    pub foreign_tunnel_up: bool,
+    /// Не удалось прочитать живую таблицу маршрутов, а лог при этом
+    /// СПОКОЙНО говорит «не поднято» — про `foreign_tunnel_up` сказать
+    /// нечего честно, но про `our_tunnel_up` вопросов нет и без маршрутов
+    /// (уточнение round 2: лог, уверенно сказавший «нет», не нуждается в
+    /// подтверждении маршрутами — участие маршрутов там только
+    /// подтверждающее). Гасит только кнопку подъёма.
+    pub routes_error: Option<String>,
+}
 
 /// Тумблер автозапуска.
 ///
@@ -104,6 +251,37 @@ impl Autostart for AutostartPending {
 
     fn set(&self, _on: bool) -> Result<(), String> {
         Err("автозапуск ещё не подключён в этой сборке".to_string())
+    }
+}
+
+/// Заглушка `Tunnel` для тестов, которым сам туннель безразличен (например,
+/// тесты `websrv.rs`, проверяющие транспорт, а не раздел «Туннель»): всегда
+/// «OpenVPN не найден», действия отказывают явным текстом, а не молчат.
+/// Только для тестов — публична ради сборки тестов из других файлов крейта
+/// (`websrv.rs`), тем же приёмом, что и `AutostartPending`.
+#[cfg(test)]
+pub struct TunnelPending;
+
+#[cfg(test)]
+impl Tunnel for TunnelPending {
+    fn snapshot(&self, _office_subnets: &[Ipv4Net], _profile_name: &str) -> TunnelSnapshot {
+        TunnelSnapshot::default()
+    }
+    fn build_profile(
+        &self,
+        _profile_name: &str,
+        _office_subnets: &[Ipv4Net],
+    ) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn raise(&self, _profile_name: &str) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn lower(&self, _profile_name: &str) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
+    }
+    fn install_service(&self) -> Result<(), String> {
+        Err("туннель ещё не подключён в этой сборке".to_string())
     }
 }
 
@@ -173,6 +351,15 @@ pub struct SettingsState {
     /// Порт, на котором мост слушает СЕЙЧАС и до конца жизни процесса.
     pub bound_port: u16,
     pub autostart: Arc<dyn Autostart>,
+    /// OpenVPN-туннель и установка службы статического IP (задача 7).
+    pub tunnel: Arc<dyn Tunnel>,
+    /// Итог последней фоновой проверки обновлений (`update::check::run`,
+    /// вызывается из `main.rs`). `None` — проверка ещё ни разу не
+    /// завершилась (тумблер мог быть выключен всё это время, или процесс
+    /// только что стартовал и первая проверка ещё не дошла до тика) —
+    /// страница обязана отличать это от `Failed`: «ещё не проверяли» не то
+    /// же самое, что «проверили и не получилось».
+    pub update_status: Arc<ArcSwap<Option<CheckOutcome>>>,
 }
 
 /// Что показать над формой после действия.
@@ -376,7 +563,15 @@ pub fn config_from_form(base: &Config, form: &Form) -> Result<Config, String> {
         http_upstream: optional(form.get("http_upstream")),
         no_proxy: normalise_bypass(form.get("no_proxy").unwrap_or_default()),
         manage_system_proxy: form.checked("manage_system_proxy"),
+        // Задача 3: выключает только сетевой опрос релизов, не проверку
+        // подписи уже скачанного файла — той негде быть выключателем в
+        // конфиге вовсе (докблок `update::verify`).
+        check_for_updates: form.checked("check_for_updates"),
         office_networks,
+        // Спека 8.5: по умолчанию выключено — форма не присылает поле
+        // вовсе, пока человек его не отметил (`Form::checked`), и тогда
+        // `false` — то же самое значение, что и `Config::default()`.
+        automate_tunnel: form.checked("automate_tunnel"),
         // Всё остальное — из текущего конфига, а не из формы, и это не
         // экономия. `mode` переключает трей; тайминги и предел соединений
         // правятся файлом; `saved_sysproxy` — единственный след системных
@@ -424,6 +619,7 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
     b.push_str("</style></head>\n<body>\n");
 
     b.push_str("<h1>ProxyPilot</h1>\n");
+    b.push_str("<section class=\"card\">\n");
     b.push_str(&format!(
         "<p class=\"now\">Мост слушает <b>127.0.0.1:{port}</b> · {route}<br>{network}</p>\n",
         port = app.port,
@@ -440,11 +636,15 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             ));
         }
     }
+    b.push_str("</section>\n");
 
     // Форма настроек. Отдельная от кнопок замера и диагностики: те не
-    // должны тащить с собой поля, которые человек ещё правит.
+    // должны тащить с собой поля, которые человек ещё правит. Каждый раздел
+    // — своя карточка (`section.card`): границы разделов держит вёрстка, а
+    // не подчёркивание под заголовком.
     b.push_str("<form method=\"post\" action=\"\">\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"upstreams\">\n");
     b.push_str("<h2 id=\"upstreams\">Апстримы</h2>\n");
     // Что применяется сразу, а что при запуске, сказано у каждого раздела
     // своими словами: одна общая оговорка внизу страницы читается ровно теми,
@@ -458,15 +658,17 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         "socks_upstream",
         "SOCKS5",
         cfg.socks_upstream.as_deref().unwrap_or(""),
-        &health_text(cfg.socks_upstream.as_deref(), app.health.socks),
+        &health_chip(cfg.socks_upstream.as_deref(), app.health.socks),
     ));
     b.push_str(&field(
         "http_upstream",
         "HTTP-прокси",
         cfg.http_upstream.as_deref().unwrap_or(""),
-        &health_text(cfg.http_upstream.as_deref(), app.health.http),
+        &health_chip(cfg.http_upstream.as_deref(), app.health.http),
     ));
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"port\">\n");
     b.push_str("<h2 id=\"port\">Порт моста</h2>\n");
     b.push_str(&field(
         "bridge_port",
@@ -494,22 +696,40 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             bound = state.bound_port
         ));
     }
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"networks\">\n");
     b.push_str("<h2 id=\"networks\">Офисные сети</h2>\n");
     b.push_str(
         "<p class=\"hint\">Применяется сразу. Решение принимается по GUID: имя \
          сети человек может переименовать в любой момент. Чтобы убрать сеть — \
          очистите её GUID и сохраните.</p>\n",
     );
-    b.push_str("<table>\n<tr><th>GUID</th><th>Имя</th></tr>\n");
+    b.push_str("<div class=\"table-wrap\"><table>\n<tr><th>GUID</th><th>Имя</th></tr>\n");
     for net in cfg.office_networks.iter() {
         b.push_str(&office_row(&net.id, &net.name));
     }
     // Пустая строка для добавления руками. Пустой id отбрасывается при
     // разборе, поэтому нетронутая строка ничего не портит.
     b.push_str(&office_row("", ""));
-    b.push_str("</table>\n");
+    b.push_str("</table></div>\n");
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"tunnel-automation\">\n");
+    b.push_str("<h2 id=\"tunnel-automation\">Автоматика туннеля</h2>\n");
+    b.push_str(&checkbox(
+        "automate_tunnel",
+        "Поднимать туннель автоматически вне офиса",
+        cfg.automate_tunnel,
+        false,
+        "Выключено по умолчанию (спека 8.5) — туннель поднимается руками, пока \
+         вы не включите это сами. Пока только сохраняет намерение: сам подъём и \
+         опускание по смене сети этот тумблер ещё не выполняет — управляйте \
+         туннелем кнопками ниже.",
+    ));
+    b.push_str("</section>\n");
+
+    b.push_str("<section class=\"card\" aria-labelledby=\"bypass\">\n");
     b.push_str("<h2 id=\"bypass\">Мимо прокси</h2>\n");
     b.push_str(&format!(
         "<label for=\"no_proxy\">Адреса и подсети, по одному в строке или через \
@@ -521,7 +741,9 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         "<p class=\"warn\">Список применяется при запуске: после изменения \
          перезапустите ProxyPilot.</p>\n",
     );
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"system\">\n");
     b.push_str("<h2 id=\"system\">Система</h2>\n");
     b.push_str(&checkbox(
         "manage_system_proxy",
@@ -544,8 +766,25 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         !autostart_note.is_empty(),
         &autostart_note,
     ));
+    b.push_str("</section>\n");
 
-    b.push_str("<p class=\"buttons\">");
+    b.push_str("<section class=\"card\" aria-labelledby=\"updates\">\n");
+    b.push_str("<h2 id=\"updates\">Обновления</h2>\n");
+    b.push_str(&checkbox(
+        "check_for_updates",
+        "Проверять обновления",
+        cfg.check_for_updates,
+        false,
+        "Проверка идёт в фоне раз в сутки и никогда не задерживает запуск \
+         или работу моста. Скачанный файл проверяется подписью \
+         Authenticode перед заменой; без подтверждённой подписи \
+         обновление не устанавливается — эта проверка тумблером не \
+         управляется и не выключается никогда.",
+    ));
+    b.push_str(&update_status_note(&state.update_status.load()));
+    b.push_str("</section>\n");
+
+    b.push_str("<div class=\"actions\">");
     b.push_str("<button type=\"submit\" name=\"action\" value=\"save\">Сохранить</button>");
     // Кнопка «эта сеть — офис» — обычная кнопка отправки, а не скрипт: GUID
     // текущей сети сервер и так знает из `AppState.place`, а страница без
@@ -563,10 +802,21 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
             escape_html(name)
         ));
     }
-    b.push_str("</p>\n</form>\n");
+    b.push_str("</div>\n</form>\n");
+
+    // Раздел «Туннель» — отдельными формами по той же причине, что и замер
+    // и диагностика ниже: каждая кнопка не должна тащить с собой поля
+    // настроек, которые человек ещё правит.
+    let tunnel_snapshot = state
+        .tunnel
+        .snapshot(&cfg.office_subnets, TUNNEL_PROFILE_NAME);
+    b.push_str("<section class=\"card\" aria-labelledby=\"tunnel\">\n");
+    b.push_str(&tunnel_section(&cfg.office_subnets, &tunnel_snapshot));
+    b.push_str("</section>\n");
 
     // Замер и диагностика — отдельными формами: их кнопки не должны
     // отправлять поля настроек, которые человек ещё правит.
+    b.push_str("<section class=\"card\" aria-labelledby=\"bench\">\n");
     b.push_str("<h2 id=\"bench\">Замер скорости</h2>\n");
     b.push_str(&format!(
         "<p class=\"hint\">Один поток и короткий файл: цифры сравнивают \
@@ -574,43 +824,191 @@ pub fn render(state: &SettingsState, outcome: Option<&Outcome>) -> String {
         escape_html(BENCH_URL)
     ));
     b.push_str(
-        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
-         value=\"bench\">Замерить</button></form>\n",
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"bench\">Замерить</button></form>\n",
     );
     if let Some(results) = outcome.and_then(|o| o.bench.as_ref()) {
         b.push_str(&bench_table(results));
     }
+    b.push_str("</section>\n");
 
+    b.push_str("<section class=\"card\" aria-labelledby=\"doctor\">\n");
     b.push_str("<h2 id=\"doctor\">Диагностика</h2>\n");
     b.push_str(
-        "<form method=\"post\" action=\"\"><button type=\"submit\" name=\"action\" \
-         value=\"doctor\">Проверить</button></form>\n",
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"doctor\">Проверить</button></form>\n",
     );
     if let Some(checks) = outcome.and_then(|o| o.doctor.as_ref()) {
         b.push_str(&doctor_table(checks));
     }
+    b.push_str("</section>\n");
 
     b.push_str("</body></html>\n");
     b
 }
 
-const STYLE: &str = "\
-body{font:14px/1.5 'Segoe UI',system-ui,sans-serif;margin:2rem auto;max-width:46rem;padding:0 1rem}\
-h1{font-size:1.4rem}h2{font-size:1.05rem;margin-top:1.8rem;border-bottom:1px solid #ccc;padding-bottom:.2rem}\
-label{display:block;margin-top:.8rem}\
-input[type=text],textarea{width:100%;box-sizing:border-box;font-family:inherit}\
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.2rem .4rem 0 0}\
-.now{background:#f3f3f3;padding:.6rem;border-radius:4px}\
-.hint,.warn,.note{margin:.4rem 0}.hint{color:#555}.warn{color:#7a4a00}\
-.note{padding:.5rem;border-radius:4px}.note.good{background:#e6f4e6}.note.bad{background:#fbe6e6}\
-.buttons{margin-top:1.4rem}button{margin-right:.6rem;padding:.4rem .9rem}\
-.ok{color:#1a6b1a}.fail{color:#a11}.pre{white-space:pre-wrap;font-family:Consolas,monospace}";
+/// Вся вёрстка страницы — один инлайн `<style>`, потому что CSP разрешает
+/// именно это (`style-src 'self' 'unsafe-inline'`) и запрещает вообще любой
+/// скрипт: значит состояния, переключатели и раскладка обязаны решаться
+/// чистым CSS (`:has()`, `:focus-visible`, `accent-color`-подобные трюки на
+/// нативном `<input type=checkbox>`, медиа-запросы), а не JS.
+///
+/// Три принципа, которые тут закодированы:
+///
+/// 1. **Тёмная тема — через `prefers-color-scheme`, без переключателя.**
+///    Трей живёт на рабочем столе, где тёмная тема — обычное дело; второй
+///    системы цветов, кроме системной, здесь нет и не должно быть.
+/// 2. **Состояние — не только цветом.** «доступен» / «недоступен» / «не
+///    задан» и «ок» / «внимание» / «отказ» получают ещё и разную форму
+///    значка (кружок с «✓», «✕», «!», «…», «—»), потому что часть людей не
+///    отличает красный от зелёного — тот же довод, по которому иконки в
+///    трее различаются формой, а не только цветом.
+/// 3. **Ни один шрифт не подгружается извне.** Сокет — локальный,
+///    `default-src 'self'` не пропустит ни один внешний хост, поэтому оба
+///    стека — только системные гарнитуры Windows.
+const STYLE: &str = r#"
+:root{
+  --bg:#f3f4f6;--bg-elevated:#ffffff;--fg:#1a1d21;--fg-muted:#5b6169;
+  --border:#d9dce1;--accent:#2f5fd6;--focus:#2f5fd6;--focus-ring:rgba(47,95,214,.28);
+  --good-fg:#146c37;--good-bg:#e3f5e9;--bad-fg:#a3241c;--bad-bg:#fbe8e6;
+  --warn-fg:#8a5a00;--warn-bg:#fbf0d9;
+  --sans:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
+  --mono:'Cascadia Mono',Consolas,'Courier New',monospace;--radius:10px;
+}
+/* Тёмная тема следует системной настройке; собственного переключателя нет
+   намеренно — на странице без скрипта переключать было бы нечем. */
+@media (prefers-color-scheme:dark){:root{
+  --bg:#15171b;--bg-elevated:#1e2126;--fg:#e8eaed;--fg-muted:#9aa0a8;
+  --border:#33373e;--accent:#7aa5ff;--focus:#7aa5ff;--focus-ring:rgba(122,165,255,.35);
+  --good-fg:#5fd88b;--good-bg:#173225;--bad-fg:#ff9086;--bad-bg:#3a201f;
+  --warn-fg:#f0c14b;--warn-bg:#3a2f12;
+}}
+*{box-sizing:border-box}
+body{font:15px/1.55 var(--sans);margin:0;padding:2.25rem 1rem 4rem;max-width:44rem;
+  margin-inline:auto;background:var(--bg);color:var(--fg)}
+h1{font-size:1.55rem;font-weight:650;letter-spacing:-.01em;margin:.1rem 0 1.4rem}
+h2{font-size:1.02rem;font-weight:650;margin:0 0 .8rem;color:var(--fg)}
+section.card{background:var(--bg-elevated);border:1px solid var(--border);
+  border-radius:var(--radius);padding:1.15rem 1.3rem;margin-bottom:1rem;
+  box-shadow:0 1px 2px rgba(0,0,0,.05)}
+label{display:block;margin-top:.9rem;font-weight:500}
+input[type=text],textarea{width:100%;font:inherit;color:var(--fg);background:var(--bg);
+  border:1px solid var(--border);border-radius:8px;padding:.5rem .65rem;margin-top:.35rem;
+  transition:border-color .15s,box-shadow .15s}
+textarea{min-height:5rem;resize:vertical}
+input[type=text]:focus-visible,textarea:focus-visible{
+  outline:none;border-color:var(--focus);box-shadow:0 0 0 3px var(--focus-ring)}
+table{border-collapse:collapse;width:100%;font-size:.92rem}
+th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border)}
+th{font-weight:600;color:var(--fg-muted);font-size:.78rem;text-transform:uppercase;
+  letter-spacing:.03em}
+table input[type=text]{margin-top:0}
+.table-wrap{overflow-x:auto;margin-top:.5rem}
+/* Нативный чекбокс перерисован в переключатель чистым CSS — `appearance:none`
+   плюс `::before` для ползунка; никакого скрипта для этого не нужно. */
+label:has(>input[type=checkbox]){display:flex;align-items:center;gap:.65rem;
+  padding:.45rem 0;cursor:pointer;font-weight:500}
+input[type=checkbox]{appearance:none;-webkit-appearance:none;width:2.15rem;height:1.2rem;
+  border-radius:999px;background:var(--border);position:relative;flex:none;margin:0;
+  cursor:pointer;transition:background-color .15s}
+input[type=checkbox]::before{content:"";position:absolute;top:2px;left:2px;width:1rem;
+  height:1rem;border-radius:50%;background:var(--bg-elevated);
+  box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}
+input[type=checkbox]:checked{background:var(--accent)}
+input[type=checkbox]:checked::before{transform:translateX(.95rem)}
+input[type=checkbox]:disabled{opacity:.5;cursor:not-allowed}
+input[type=checkbox]:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+button{font:inherit;font-weight:600;border:1px solid var(--accent);border-radius:8px;
+  padding:.55rem 1.1rem;min-height:2.5rem;cursor:pointer;background:var(--accent);
+  color:#fff;transition:filter .15s,transform .05s}
+button:hover{filter:brightness(1.08)}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+/* Кнопка «Сохранить» — единственное основное действие формы, поэтому
+   единственная сплошная; сеть-в-офис и кнопки разделов ниже — второстепенные
+   действия, поэтому контурные (тот же язык, что у переключателя). */
+button[value=office]{background:transparent;color:var(--accent)}
+button[value=office]:hover{background:var(--accent);color:#fff}
+form.action button{background:transparent;color:var(--accent)}
+form.action button:hover{background:var(--accent);color:#fff}
+/* Установка службы — единственный путь к UAC во всём приложении (см.
+   CLAUDE.md, «Права администратора») — помечена отдельным цветом, чтобы
+   не потеряться среди обычных кнопок. */
+form.action button[value=install_service]{color:var(--warn-fg);border-color:var(--warn-fg)}
+form.action button[value=install_service]:hover{background:var(--warn-fg);color:#fff}
+form.action{display:inline-block;margin:0 .5rem .5rem 0}
+.actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1.2rem}
+.now{background:var(--bg);border:1px dashed var(--border);border-radius:8px;
+  padding:.75rem .9rem;font-size:.95rem;line-height:1.6}
+.now b{font-variant-numeric:tabular-nums}
+.hint{color:var(--fg-muted);font-size:.88rem;margin:.4rem 0}
+.warn{color:var(--warn-fg);font-size:.88rem;margin:.5rem 0;padding:.5rem .7rem;
+  background:var(--warn-bg);border-radius:8px}
+.note{margin:.5rem 0;padding:.6rem .8rem;border-radius:8px;font-size:.92rem;
+  display:flex;align-items:flex-start;gap:.55rem}
+.note::before{flex:none;font-weight:700}
+.note.good{background:var(--good-bg);color:var(--good-fg)}
+.note.good::before{content:"✓"}
+.note.bad{background:var(--bad-bg);color:var(--bad-fg)}
+.note.bad::before{content:"✕"}
+/* Значок статуса апстрима — форма плюс цвет, не только цвет (см. докблок
+   константы). */
+.chip{display:inline-flex;align-items:center;gap:.3rem;font-size:.82rem;font-weight:600;
+  padding:.15rem .55rem;border-radius:999px}
+.chip::before{font-weight:700}
+.chip.status-up{background:var(--good-bg);color:var(--good-fg)}
+.chip.status-up::before{content:"✓"}
+.chip.status-down{background:var(--bad-bg);color:var(--bad-fg)}
+.chip.status-down::before{content:"✕"}
+.chip.status-unknown{background:var(--warn-bg);color:var(--warn-fg)}
+.chip.status-unknown::before{content:"…"}
+.chip.status-unset{background:var(--border);color:var(--fg-muted)}
+.chip.status-unset::before{content:"—"}
+.checks{list-style:none;margin:.75rem 0 0;padding:0}
+.check{display:flex;gap:.65rem;align-items:flex-start;padding:.65rem .8rem;
+  border:1px solid var(--border);border-radius:8px;margin-bottom:.5rem;background:var(--bg)}
+.check::before{flex:none;width:1.3rem;height:1.3rem;border-radius:50%;display:flex;
+  align-items:center;justify-content:center;font-size:.78rem;font-weight:700;color:#fff}
+.check.ok::before{content:"✓";background:var(--good-fg)}
+.check.warn::before{content:"!";background:var(--warn-fg)}
+.check.fail::before{content:"✕";background:var(--bad-fg)}
+.check-body{flex:1;min-width:0}
+.check-head{display:flex;justify-content:space-between;gap:.6rem;flex-wrap:wrap}
+.check-title{font-weight:600}
+.check-status{font-size:.72rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.03em;color:var(--fg-muted)}
+.check-detail{margin-top:.3rem;font-family:var(--mono);font-size:.82rem;
+  color:var(--fg-muted);white-space:pre-wrap;word-break:break-word}
+.bench-results{list-style:none;margin:.75rem 0 0;padding:0}
+.bench-row{display:grid;grid-template-columns:1fr auto auto;gap:.4rem 1rem;
+  align-items:center;padding:.55rem .8rem;border:1px solid var(--border);border-radius:8px;
+  margin-bottom:.4rem;background:var(--bg)}
+.bench-row.winner{border-color:var(--good-fg)}
+.bench-row.failed{border-color:var(--bad-fg)}
+.bench-label{font-weight:600}
+.bench-speed{font-variant-numeric:tabular-nums;color:var(--fg-muted)}
+.ok{color:var(--good-fg);font-weight:600}
+.fail{color:var(--bad-fg);font-weight:600}
+/* Страница открывается в том окне браузера, какое случится — узкое не
+   исключение. */
+@media (max-width:480px){
+  body{padding:1.4rem .75rem 3rem}
+  section.card{padding:.9rem 1rem}
+  .bench-row{grid-template-columns:1fr}
+  .check-head{flex-direction:column;gap:.15rem}
+}
+"#;
 
-fn field(name: &str, label: &str, value: &str, note: &str) -> String {
-    let note = if note.is_empty() {
+/// `note_html` — уже готовая разметка (значок статуса или пусто), не
+/// сырой текст: единственный вызывающий, которому есть что показать
+/// (апстримы), собирает её через [`health_chip`], которая экранирует
+/// текст сама. Собственного экранирования здесь поэтому нет — второе
+/// было бы дублем первого, а не защитой.
+fn field(name: &str, label: &str, value: &str, note_html: &str) -> String {
+    let note = if note_html.is_empty() {
         String::new()
     } else {
-        format!(" <span class=\"hint\">{}</span>", escape_html(note))
+        format!(" {note_html}")
     };
     format!(
         "<label for=\"{name}\">{label}{note}</label>\n\
@@ -645,6 +1043,174 @@ fn office_row(id: &str, name: &str) -> String {
     )
 }
 
+/// Раздел «Туннель»: где мы стоим (OpenVPN найден? профиль собран?
+/// поднято?), явное предупреждение про DNS до подъёма (спека 8.2), и
+/// кнопки — свои, отдельными формами (см. комментарий в `render`).
+///
+/// Если поднят чужой туннель в наши сети — кнопка подъёма не рисуется
+/// вовсе (приёмка задачи 7): показывать кнопку, которая приведёт к двум
+/// туннелям, спорящим за маршруты, значит предлагать человеку то, что мы
+/// уже знаем — плохая идея.
+fn tunnel_section(office_subnets: &[Ipv4Net], snap: &TunnelSnapshot) -> String {
+    let mut b = String::new();
+    b.push_str("<h2 id=\"tunnel\">Туннель (OpenVPN)</h2>\n");
+
+    if !snap.installed {
+        // Приёмка: раздел неактивен с внятным объяснением, а не просто
+        // серый — дальше в разделе рисовать нечего, все прочие поля снимка
+        // не имеют смысла без установленного OpenVPN.
+        b.push_str(
+            "<p class=\"hint\">OpenVPN не найден на этой машине — раздел \
+             недоступен. Установите OpenVPN (openvpn.net/community-downloads) \
+             и откройте эту страницу снова.</p>\n",
+        );
+        return b;
+    }
+
+    if office_subnets.is_empty() {
+        b.push_str(
+            "<p class=\"hint\">Офисные подсети не заданы — маршруты в профиль \
+             не добавятся (раздел «Апстримы» их не хранит; правится файлом \
+             конфига).</p>\n",
+        );
+    } else {
+        let list = office_subnets
+            .iter()
+            .map(Ipv4Net::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        b.push_str(&format!(
+            "<p class=\"hint\">Через туннель маршрутизируются подсети: {}.</p>\n",
+            escape_html(&list)
+        ));
+    }
+
+    let profile_word = if snap.profile_installed {
+        "установлен"
+    } else {
+        "не собран"
+    };
+    b.push_str(&format!(
+        "<p>Профиль в OpenVPN: <b>{profile_word}</b> (имя «{}»; поднят ли \
+         туннель — определяется по логу OpenVPN GUI для этого же имени, а \
+         не по имени адаптера).</p>\n",
+        escape_html(TUNNEL_PROFILE_NAME)
+    ));
+
+    // Приёмка: пользователь узнаёт про DNS ДО подъёма, а не догадывается —
+    // показывается всегда, а не только когда туннель уже поднят.
+    b.push_str(
+        "<p class=\"warn\">Пока туннель поднят, все DNS-запросы уходят в офис \
+         — так резолвятся внутренние имена (git, dev-серверы), и это \
+         осознанная плата (спека 8.2). Вне туннеля резолвинг снова \
+         обычный.</p>\n",
+    );
+
+    // Приоритет проверок — не произвольный порядок if/else, а прямое
+    // следствие fix round 1 задачи 7: `our_tunnel_up` (лог, ключ — имя
+    // профиля, которым мы владеем) проверяется РАНЬШЕ `foreign_tunnel_up`
+    // (таблица маршрутов + псевдоним адаптера, которым мы не владеем).
+    // Обратный порядок — ровно то, что сломалось до этого исправления:
+    // наш же поднятый туннель, классифицированный как «чужой» по
+    // ненадёжному алиасу, прятал кнопку «опустить» и запирал раздел
+    // навсегда. Теперь подтверждённая логом поднятость перевешивает любую
+    // догадку по маршрутам.
+    if let Some(err) = &snap.liveness_error {
+        // Честное «не знаю» — не запертые кнопки. Обе кнопки показаны:
+        // повторный connect/disconnect для уже подключённого/отключённого
+        // профиля openvpn-gui.exe принимает как обычную команду (докблок
+        // `openvpn::connect`/`disconnect` — «Ok» значит «доставлено», не
+        // «изменило состояние»), а раздел, который вместо этого молча
+        // прячет обе кнопки, — тот самый дедлок, который здесь как раз
+        // устраняется.
+        b.push_str(&format!(
+            "<p class=\"note bad\">Не удалось определить, поднят ли туннель \
+             (лог OpenVPN GUI): {} — состояние неизвестно. Обе кнопки ниже \
+             показаны: лишний повторный подъём или опускание для OpenVPN \
+             GUI обычно безвреден, но после нажатия стоит свериться с \
+             иконкой ProxyPilot в трее.</p>\n",
+            escape_html(err)
+        ));
+        b.push_str(&tunnel_action_form("raise_tunnel", "Поднять туннель"));
+        b.push_str(&tunnel_action_form("lower_tunnel", "Опустить туннель"));
+    } else if snap.our_tunnel_up {
+        b.push_str("<p class=\"note good\">Туннель поднят.</p>\n");
+        b.push_str(&tunnel_action_form("lower_tunnel", "Опустить туннель"));
+    } else if snap.rising {
+        // Round 2: лог уже подтвердил успешное подключение, но маршруты
+        // профиля ещё не встали — короткое окно сразу после «Поднять
+        // туннель». Не «опущен» (выглядело бы как приглашение нажать
+        // «Поднять» ещё раз, породив второй connect) и не «поднят» (это
+        // ещё не доказано маршрутами) — отдельная, спокойная формулировка.
+        // Кнопка «опустить» предложена как отмена: команда disconnect
+        // тому же профилю прерывает и ещё не завершившееся подключение.
+        b.push_str("<p class=\"note good\">Туннель поднимается…</p>\n");
+        b.push_str(&tunnel_action_form(
+            "lower_tunnel",
+            "Отменить / опустить туннель",
+        ));
+    } else if let Some(err) = &snap.routes_error {
+        b.push_str(&format!(
+            "<p class=\"note bad\">Туннель опущен. Не удалось прочитать \
+             таблицу маршрутов, чтобы проверить, не занят ли он уже другим \
+             VPN: {} — подъём временно недоступен, пока это не \
+             исправится.</p>\n",
+            escape_html(err)
+        ));
+    } else if snap.foreign_tunnel_up {
+        // Не «ЧУЖОЙ туннель» безусловно: адаптер мог остаться и от нашей
+        // же незакрытой предыдущей сессии — алиас это не различает (см.
+        // докблок TUNNEL_PROFILE_NAME). Безопасное действие одно и то же
+        // в обоих случаях — не поднимать поверх, — поэтому текст говорит
+        // «занято», а не приписывает адаптер конкретно чужому VPN.
+        b.push_str(
+            "<p class=\"note bad\">Туннель опущен, но какой-то туннельный \
+             адаптер уже несёт офисные подсети (другой VPN, Tailscale, \
+             WireGuard... или наша же не до конца закрытая прошлая сессия — \
+             отличить по имени адаптера нельзя). Поднимать свой нельзя — \
+             два туннеля будут спорить за маршруты. Закройте тот, что уже \
+             поднят, и вернитесь сюда.</p>\n",
+        );
+    } else {
+        b.push_str("<p>Туннель опущен.</p>\n");
+        if snap.profile_installed {
+            b.push_str(&tunnel_action_form("raise_tunnel", "Поднять туннель"));
+        } else {
+            b.push_str("<p class=\"hint\">Сначала соберите профиль — кнопка ниже.</p>\n");
+        }
+    }
+
+    // Приёмка: явное предупреждение про UAC у обеих кнопок, ДО нажатия —
+    // одним абзацем перед обеими, а не после клика.
+    b.push_str(
+        "<p class=\"hint\">Кнопки ниже выходят за рамки обычной работы \
+         приложения. «Собрать профиль» пишет .ovpn-файл в каталог \
+         конфигураций OpenVPN — прав администратора не нужно, окна UAC не \
+         будет. «Установить службу статического IP» — да, нужны права \
+         администратора: Windows покажет запрос UAC, единственный во всём \
+         приложении.</p>\n",
+    );
+    b.push_str(&tunnel_action_form(
+        "build_tunnel_profile",
+        "Собрать профиль",
+    ));
+    b.push_str(&tunnel_action_form(
+        "install_service",
+        "Установить службу статического IP…",
+    ));
+
+    b
+}
+
+fn tunnel_action_form(action: &str, label: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"\" class=\"action\"><button type=\"submit\" \
+         name=\"action\" value=\"{action}\">{label}</button></form>\n",
+        action = escape_html(action),
+        label = escape_html(label),
+    )
+}
+
 /// Строка про апстрим: адрес плюс то, отвечал ли он на последней пробе.
 /// «Не задан» отделено от «недоступен» тем же словарём, что и в трее:
 /// первое чинится настройкой, второе — сетью.
@@ -657,6 +1223,91 @@ fn health_text(addr: Option<&str>, health: Reachability) -> String {
         Reachability::Down => "недоступен".to_string(),
         Reachability::Unknown => "ещё не проверен".to_string(),
     }
+}
+
+/// Класс значка для того же состояния, что и [`health_text`] — разнесены,
+/// а не слиты в одну строку «class:text»: два места, разбирающих такую
+/// строку обратно, были бы более хрупким кодом, чем два маленьких `match`.
+fn health_class(addr: Option<&str>, health: Reachability) -> &'static str {
+    if addr.is_none_or(str::is_empty) {
+        return "status-unset";
+    }
+    match health {
+        Reachability::Up => "status-up",
+        Reachability::Down => "status-down",
+        Reachability::Unknown => "status-unknown",
+    }
+}
+
+/// Готовый значок статуса апстрима для вставки в разметку — форма (через
+/// класс, см. докблок [`STYLE`]) плюс текст, который уже нельзя спутать по
+/// смыслу (те же три слова, что и в трее).
+fn health_chip(addr: Option<&str>, health: Reachability) -> String {
+    format!(
+        "<span class=\"chip {}\">{}</span>",
+        health_class(addr, health),
+        escape_html(&health_text(addr, health))
+    )
+}
+
+/// Итог последней проверки обновлений человеческим текстом. Отдельная
+/// чистая функция от разметки ([`update_status_note`]) ради теста: приёмка
+/// задачи 3 прямо требует, что отказ сети НЕ показывается как «вы в курсе
+/// последней версии» — здесь это проверяется без HTTP-сервера и токенов.
+///
+/// `bool` в возврате — «эта строка плохая новость» (класс `.note.bad`, тот
+/// же словарь, что и у [`Outcome::bad`]): не по одному только цвету (см.
+/// докблок [`STYLE`]), но текст всё равно должен идти со своим классом.
+fn update_status_text(status: &Option<CheckOutcome>) -> (bool, String) {
+    match status {
+        None => (
+            false,
+            "ещё не проверялось — первая проверка идёт в фоне после старта".to_string(),
+        ),
+        Some(CheckOutcome::Disabled) => (false, "проверка выключена".to_string()),
+        Some(CheckOutcome::UpToDate) => (false, "установлена последняя версия".to_string()),
+        Some(CheckOutcome::CurrentIsNewer) => (
+            false,
+            "у вас версия новее опубликованной — ставить нечего".to_string(),
+        ),
+        Some(CheckOutcome::Unrecognized) => (
+            true,
+            "опубликованную версию не удалось разобрать — проверьте вручную".to_string(),
+        ),
+        Some(CheckOutcome::PublishedIsPrerelease(tag)) => (
+            false,
+            format!("опубликован только предрелиз {tag} — предрелизы не предлагаются"),
+        ),
+        Some(CheckOutcome::Failed(reason)) => (
+            true,
+            // Приёмка: отказ сети — НЕ «вы в курсе последней версии».
+            format!("проверка не удалась (сеть недоступна или сервер не ответил): {reason}"),
+        ),
+        Some(CheckOutcome::StagedForNextLaunch { tag }) => (
+            false,
+            format!(
+                "обновление {tag} скачано, подпись подтверждена — установится \
+                 при следующем запуске ProxyPilot"
+            ),
+        ),
+        Some(CheckOutcome::RefusedUnsigned { tag, reason }) => (
+            true,
+            format!(
+                "найдено обновление {tag}, но подпись не подтверждена — \
+                 обновление НЕ установлено ({reason}). Обновитесь вручную: \
+                 github.com/denislibs/proxy-pilot/releases"
+            ),
+        ),
+    }
+}
+
+fn update_status_note(status: &Option<CheckOutcome>) -> String {
+    let (bad, text) = update_status_text(status);
+    format!(
+        "<p class=\"note {cls}\">{text}</p>\n",
+        cls = if bad { "bad" } else { "good" },
+        text = escape_html(&text)
+    )
 }
 
 /// То же, что показывает заголовок меню: что с трафиком происходит НА САМОМ
@@ -692,36 +1343,50 @@ fn network_text(app: &AppState) -> String {
     }
 }
 
+/// Результаты замера — список карточек, а не таблица: у каждого маршрута
+/// свой блок с рамкой, подсвеченной по исходу (победитель / отказ), а не
+/// строка среди прочих строк. Тот же довод, что у [`doctor_table`].
 fn bench_table(results: &[BenchResult]) -> String {
     let best = fastest(results).map(|r| r.label.clone());
-    let mut out = String::from("<table>\n<tr><th>Маршрут</th><th>Скорость</th><th></th></tr>\n");
+    let mut out = String::from("<ul class=\"bench-results\">\n");
     for r in results {
+        let is_winner = best.as_deref() == Some(r.label.as_str());
+        // Путь, который не отработал, показывается как не отработавший, а не
+        // пропускается: пропущенная строка выглядела бы как «не настроен».
+        let row_class = if r.error.is_some() {
+            "failed"
+        } else if is_winner {
+            "winner"
+        } else {
+            ""
+        };
         let speed = match r.speed_bps() {
             Some(bps) => format!("{:.2} МБ/с", bps as f64 / 1_048_576.0),
             None => "—".to_string(),
         };
-        // Путь, который не отработал, показывается как не отработавший, а не
-        // пропускается: пропущенная строка выглядела бы как «не настроен».
         let note = match &r.error {
             Some(e) => format!("<span class=\"fail\">{}</span>", escape_html(e)),
-            None if best.as_deref() == Some(r.label.as_str()) => {
-                "<span class=\"ok\">быстрее прочих</span>".to_string()
-            }
+            None if is_winner => "<span class=\"ok\">быстрее прочих</span>".to_string(),
             None => format!("{} байт", r.bytes),
         };
         out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<li class=\"bench-row {row_class}\"><span class=\"bench-label\">{}</span>\
+             <span class=\"bench-speed\">{}</span><span class=\"bench-note\">{}</span></li>\n",
             escape_html(&r.label),
             escape_html(&speed),
             note
         ));
     }
-    out.push_str("</table>\n");
+    out.push_str("</ul>\n");
     out
 }
 
+/// Диагностика — список результатов, каждый со своим значком (форма, не
+/// только цвет — см. докблок [`STYLE`]), а не таблица из строк
+/// преформатированного текста: результат должен читаться как результат, а
+/// не как вывод консоли.
 fn doctor_table(checks: &[Check]) -> String {
-    let mut out = String::from("<table>\n");
+    let mut out = String::from("<ul class=\"checks\">\n");
     for c in checks {
         let (cls, mark) = match c.status {
             CheckStatus::Ok => ("ok", "ок"),
@@ -729,13 +1394,15 @@ fn doctor_table(checks: &[Check]) -> String {
             CheckStatus::Fail => ("fail", "отказ"),
         };
         out.push_str(&format!(
-            "<tr><td class=\"{cls}\">{mark}</td><td><b>{title}</b><div class=\"pre\">\
-             {detail}</div></td></tr>\n",
+            "<li class=\"check {cls}\"><div class=\"check-body\">\
+             <div class=\"check-head\"><span class=\"check-title\">{title}</span>\
+             <span class=\"check-status\">{mark}</span></div>\
+             <div class=\"check-detail\">{detail}</div></div></li>\n",
             title = escape_html(&c.title),
             detail = escape_html(&c.detail),
         ));
     }
-    out.push_str("</table>\n");
+    out.push_str("</ul>\n");
     out
 }
 
@@ -760,6 +1427,25 @@ pub async fn handle_post(state: &SettingsState, body: &[u8]) -> String {
             ..Default::default()
         },
         action @ ("save" | "office") => apply(state, &form, action == "office").await,
+        "build_tunnel_profile" => {
+            let cfg = state.config.load();
+            tunnel_outcome(
+                state
+                    .tunnel
+                    .build_profile(TUNNEL_PROFILE_NAME, &cfg.office_subnets),
+                "Профиль собран и записан в каталог конфигураций OpenVPN.",
+            )
+        }
+        "raise_tunnel" => raise_tunnel(state).await,
+        "lower_tunnel" => tunnel_outcome(
+            state.tunnel.lower(TUNNEL_PROFILE_NAME),
+            "Команда на опускание туннеля отправлена OpenVPN GUI.",
+        ),
+        "install_service" => tunnel_outcome(
+            state.tunnel.install_service(),
+            "Запрос на установку службы отправлен — подтвердите запрос UAC, \
+             если Windows его покажет.",
+        ),
         other => Outcome::bad(format!("неизвестное действие «{other}»")),
     };
     render(state, Some(&outcome))
@@ -855,6 +1541,60 @@ async fn apply(state: &SettingsState, form: &Form, add_current_network: bool) ->
         notes,
         ..Default::default()
     }
+}
+
+/// Единственный результат одной кнопки раздела «Туннель» — успех или отказ,
+/// дословно из [`Tunnel`] (приёмка задачи 7: ошибка `build_profile` не
+/// проглатывается, а доходит до человека как есть).
+fn tunnel_outcome(result: Result<(), String>, ok_text: &str) -> Outcome {
+    match result {
+        Ok(()) => Outcome {
+            notes: vec![Note {
+                bad: false,
+                text: ok_text.to_string(),
+            }],
+            ..Default::default()
+        },
+        Err(e) => Outcome::bad(e),
+    }
+}
+
+/// Обработчик «Поднять туннель» — со свежей проверкой чужого туннеля НЕ
+/// только на уровне разметки (кнопка отсутствует, если он поднят), но и
+/// здесь: прямой POST в обход кнопки (например, повторно отправленная
+/// старая форма) не должен обойти правило «не предлагать подъём», пока
+/// чужой туннель несёт наши подсети (задача 3, приёмка задачи 7).
+async fn raise_tunnel(state: &SettingsState) -> Outcome {
+    let cfg = state.config.load();
+    let snap = state
+        .tunnel
+        .snapshot(&cfg.office_subnets, TUNNEL_PROFILE_NAME);
+    // Тот же приоритет, что и в `tunnel_section`: неизвестность
+    // (`liveness_error`) НЕ блокирует — раздел в этом случае намеренно
+    // показывает кнопку (честное «не знаю» лучше запертых кнопок), а
+    // подтверждённая логом поднятость и «поднимается» (round 2 — лог уже
+    // подтвердил успех, маршруты вот-вот встанут) делают повторный подъём
+    // избыточным, но не опасным. Блокируют только те два случая, где
+    // раздел вовсе не рисует кнопку подъёма: неизвестность таблицы
+    // маршрутов и обнаруженный на ней туннель, несущий наши подсети, —
+    // оба имеют смысл только пока `our_tunnel_up == false` и
+    // `rising == false`.
+    if snap.liveness_error.is_none() && !snap.our_tunnel_up && !snap.rising {
+        if let Some(err) = &snap.routes_error {
+            return Outcome::bad(format!(
+                "не удалось прочитать таблицу маршрутов: {err} — подъём отменён"
+            ));
+        }
+        if snap.foreign_tunnel_up {
+            return Outcome::bad(
+                "туннель уже занят другим туннельным адаптером, несущим офисные подсети — подъём отменён",
+            );
+        }
+    }
+    tunnel_outcome(
+        state.tunnel.raise(TUNNEL_PROFILE_NAME),
+        "Команда на подъём туннеля отправлена OpenVPN GUI.",
+    )
 }
 
 /// Тумблер автозапуска. Возвращает строку для показа, только если есть о чём
@@ -1133,6 +1873,8 @@ mod tests {
                 commands: tx,
                 bound_port: 3129,
                 autostart,
+                tunnel: Arc::new(FakeTunnel::new(TunnelSnapshot::default())),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
             },
             rx,
         )
@@ -1394,5 +2136,577 @@ mod tests {
         let form = Form::parse(b"autostart=on");
         let note = apply_autostart(&state, &form).expect("человек ждёт результата");
         assert!(note.bad);
+    }
+
+    // ---- Задача 7: раздел «Туннель» ----
+
+    struct FakeTunnel {
+        snapshot: TunnelSnapshot,
+        build_result: Result<(), String>,
+        raise_result: Result<(), String>,
+        lower_result: Result<(), String>,
+        install_result: Result<(), String>,
+    }
+
+    impl FakeTunnel {
+        fn new(snapshot: TunnelSnapshot) -> Self {
+            Self {
+                snapshot,
+                build_result: Ok(()),
+                raise_result: Ok(()),
+                lower_result: Ok(()),
+                install_result: Ok(()),
+            }
+        }
+
+        fn failing_to_build(snapshot: TunnelSnapshot, err: &str) -> Self {
+            Self {
+                build_result: Err(err.to_string()),
+                ..Self::new(snapshot)
+            }
+        }
+    }
+
+    impl Tunnel for FakeTunnel {
+        fn snapshot(&self, _office_subnets: &[Ipv4Net], _profile_name: &str) -> TunnelSnapshot {
+            self.snapshot.clone()
+        }
+        fn build_profile(
+            &self,
+            _profile_name: &str,
+            _office_subnets: &[Ipv4Net],
+        ) -> Result<(), String> {
+            self.build_result.clone()
+        }
+        fn raise(&self, _profile_name: &str) -> Result<(), String> {
+            self.raise_result.clone()
+        }
+        fn lower(&self, _profile_name: &str) -> Result<(), String> {
+            self.lower_result.clone()
+        }
+        fn install_service(&self) -> Result<(), String> {
+            self.install_result.clone()
+        }
+    }
+
+    fn down_installed_snapshot() -> TunnelSnapshot {
+        TunnelSnapshot {
+            installed: true,
+            profile_installed: true,
+            our_tunnel_up: false,
+            rising: false,
+            liveness_error: None,
+            foreign_tunnel_up: false,
+            routes_error: None,
+        }
+    }
+
+    fn state_with_tunnel(
+        app: AppState,
+        cfg: Config,
+        tunnel: FakeTunnel,
+    ) -> (SettingsState, mpsc::Receiver<Cmd>) {
+        let (tx, rx) = mpsc::channel(4);
+        (
+            SettingsState {
+                app: Arc::new(ArcSwap::from_pointee(app)),
+                config: Arc::new(ArcSwap::from_pointee(cfg)),
+                commands: tx,
+                bound_port: 3129,
+                autostart: Arc::new(AutostartPending),
+                tunnel: Arc::new(tunnel),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn tunnel_section_explains_when_openvpn_is_not_installed() {
+        // Приёмка: раздел неактивен с внятным объяснением, а не просто серый.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(TunnelSnapshot::default()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("OpenVPN не найден"), "получили: {html}");
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"build_tunnel_profile\""));
+        assert!(!html.contains("value=\"install_service\""));
+    }
+
+    #[test]
+    fn tunnel_section_shows_a_down_tunnel_with_a_raise_button() {
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("Туннель опущен"), "получили: {html}");
+        assert!(html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn tunnel_section_hides_the_raise_button_until_a_profile_is_built() {
+        let snap = TunnelSnapshot {
+            profile_installed: false,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(
+            html.contains("Сначала соберите профиль"),
+            "получили: {html}"
+        );
+    }
+
+    #[test]
+    fn tunnel_section_shows_our_tunnel_up_with_a_lower_button() {
+        let snap = TunnelSnapshot {
+            our_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("Туннель поднят"), "получили: {html}");
+        assert!(html.contains("value=\"lower_tunnel\""));
+        assert!(!html.contains("value=\"raise_tunnel\""));
+    }
+
+    #[test]
+    fn tunnel_section_refuses_to_offer_raising_over_a_foreign_tunnel() {
+        // Приёмка: если поднят чужой туннель в наши сети — показать это и
+        // не предлагать подъём (задача 3, задача 7).
+        let snap = TunnelSnapshot {
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(
+            html.contains("уже несёт офисные подсети") || html.contains("занят"),
+            "получили: {html}"
+        );
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn our_confirmed_up_tunnel_wins_over_a_misclassified_foreign_reading() {
+        // Регрессия на fix round 1: до исправления `our_tunnel_up`
+        // определялась по имени адаптера, которое НИКОГДА не совпадает
+        // (round 1 отчёта задачи 7) — из-за этого свой же поднятый туннель
+        // читался ещё и как `foreign_tunnel_up == true` (тот же адаптер,
+        // тот же маршрут, алиас не совпал), и раздел показывал «занято»
+        // вместо кнопки «опустить» — то есть НЕЛЬЗЯ было опустить туннель,
+        // который сам же и подняли. Теперь `our_tunnel_up` (лог, ключ —
+        // имя профиля) проверяется раньше `foreign_tunnel_up` (таблица
+        // маршрутов + алиас адаптера) — оба поля здесь одновременно true,
+        // намеренно, как и было бы в реальности до исправления.
+        let snap = TunnelSnapshot {
+            our_tunnel_up: true,
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("Туннель поднят"), "получили: {html}");
+        assert!(
+            html.contains("value=\"lower_tunnel\""),
+            "кнопка опустить обязана быть доступна для своего же поднятого туннеля: {html}"
+        );
+        assert!(!html.contains("value=\"raise_tunnel\""));
+    }
+
+    #[test]
+    fn tunnel_section_names_the_rising_window_distinctly_from_down_or_up() {
+        // Round 2: лог уже подтвердил успех, а маршруты профиля ещё не
+        // встали — короткое окно сразу после «Поднять туннель». Не
+        // «опущен» (выглядело бы как приглашение нажать «Поднять» ещё
+        // раз, породив второй connect).
+        let snap = TunnelSnapshot {
+            rising: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("поднимается"), "получили: {html}");
+        assert!(!html.contains("Туннель опущен"), "получили: {html}");
+        assert!(
+            !html.contains("<p class=\"note good\">Туннель поднят.</p>"),
+            "получили: {html}"
+        );
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        // «Опустить» доступна как отмена ещё не завершившегося подъёма.
+        assert!(html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn rising_wins_over_a_misclassified_occupied_reading() {
+        let snap = TunnelSnapshot {
+            rising: true,
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("поднимается"), "получили: {html}");
+        assert!(
+            !html.contains("Туннель опущен, но какой-то"),
+            "получили: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_is_not_refused_server_side_while_rising() {
+        // «Поднимается» уже подтверждено логом — раздел не рисует кнопку
+        // «Поднять» в этом состоянии вовсе (см. рендер-тесты выше), но
+        // прямой POST в обход разметки не обязан отвечать «занято чужим»:
+        // `foreign_tunnel_up` здесь заведомо ложное срабатывание (тот же
+        // наш адаптер, маршруты которого ещё не осели) — то самое
+        // избыточное, но безвредное действие, которое round 1 уже признал
+        // нормальным для подтверждённых состояний.
+        let snap = TunnelSnapshot {
+            rising: true,
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(
+            !html.contains("подъём отменён"),
+            "«поднимается» не обязано отменять подъём: {html}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_liveness_shows_both_buttons_instead_of_locking_the_section() {
+        // Приёмка коррекции: раздел, признающий «не знаю», лучше раздела,
+        // который молча запирает обе кнопки.
+        let snap = TunnelSnapshot {
+            liveness_error: Some("тестовый отказ чтения лога".to_string()),
+            // routes/foreign — заведомо в состоянии, которое БЫ заблокировало
+            // подъём в обычном приоритете; проверяем, что liveness_error
+            // перевешивает и это тоже.
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("состояние неизвестно"), "получили: {html}");
+        assert!(html.contains("value=\"raise_tunnel\""), "получили: {html}");
+        assert!(html.contains("value=\"lower_tunnel\""), "получили: {html}");
+    }
+
+    #[test]
+    fn the_dns_caveat_is_shown_before_the_tunnel_is_ever_raised() {
+        // Приёмка: пользователь узнаёт об этом до подъёма, а не догадывается.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        let dns_pos = html
+            .find("DNS-запрос")
+            .expect("предупреждение про DNS обязано быть на странице");
+        let raise_pos = html
+            .find("value=\"raise_tunnel\"")
+            .expect("кнопка подъёма обязана быть на странице");
+        assert!(
+            dns_pos < raise_pos,
+            "предупреждение про DNS обязано стоять до кнопки подъёма"
+        );
+    }
+
+    #[test]
+    fn a_uac_warning_appears_before_both_privileged_buttons() {
+        // Приёмка: явное предупреждение про UAC у обеих кнопок, ДО нажатия.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        let build_pos = html
+            .find("value=\"build_tunnel_profile\"")
+            .expect("кнопка сборки обязана быть на странице");
+        let install_pos = html
+            .find("value=\"install_service\"")
+            .expect("кнопка установки службы обязана быть на странице");
+        let uac_pos = html
+            .find("UAC")
+            .expect("предупреждение про UAC обязано быть на странице");
+        assert!(
+            uac_pos < build_pos && uac_pos < install_pos,
+            "предупреждение обязано стоять до обеих кнопок"
+        );
+    }
+
+    #[test]
+    fn the_routes_error_disables_both_tunnel_buttons_and_is_escaped() {
+        let snap = TunnelSnapshot {
+            routes_error: Some("<script>bad</script>".to_string()),
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = render(&state, None);
+        assert!(
+            !html.contains("<script>bad"),
+            "неэкранированный скрипт в разметке"
+        );
+        assert!(html.contains("&lt;script&gt;"), "экранированного вида нет");
+        assert!(!html.contains("value=\"raise_tunnel\""));
+        assert!(!html.contains("value=\"lower_tunnel\""));
+    }
+
+    #[test]
+    fn office_subnets_are_listed_and_escaped() {
+        let cfg = Config {
+            office_subnets: vec!["203.0.113.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            cfg,
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(html.contains("203.0.113.0/24"), "получили: {html}");
+    }
+
+    #[test]
+    fn the_automate_tunnel_toggle_is_off_by_default() {
+        // Приёмка: тумблер автоматики по умолчанию выключен (спека 8.5).
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(
+            html.contains("name=\"automate_tunnel\""),
+            "получили: {html}"
+        );
+        assert!(!html.contains("name=\"automate_tunnel\" checked"));
+    }
+
+    #[test]
+    fn the_automate_tunnel_toggle_can_be_turned_on_and_saved() {
+        let cfg = Config {
+            automate_tunnel: true,
+            ..Default::default()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            cfg,
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = render(&state, None);
+        assert!(
+            html.contains("name=\"automate_tunnel\" checked"),
+            "получили: {html}"
+        );
+    }
+
+    #[test]
+    fn automate_tunnel_survives_config_from_form() {
+        let next = config_from_form(
+            &base(),
+            &form(&format!("{}&automate_tunnel=on", unchanged_body(3129))),
+        )
+        .unwrap();
+        assert!(next.automate_tunnel);
+    }
+
+    #[tokio::test]
+    async fn a_failed_profile_build_is_shown_not_swallowed() {
+        // Приёмка: ошибка build_profile доходит до пользователя, не
+        // проглатывается.
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::failing_to_build(
+                down_installed_snapshot(),
+                "незакрытый inline-блок «<ca>» (строка 2)",
+            ),
+        );
+        let html = handle_post(&state, b"action=build_tunnel_profile").await;
+        assert!(
+            html.contains("незакрытый inline-блок"),
+            "ошибка build_profile обязана быть показана дословно: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_is_refused_server_side_when_a_foreign_tunnel_is_up() {
+        // Защита не только на уровне разметки (кнопки нет), но и на уровне
+        // обработчика: прямой POST в обход кнопки тоже обязан быть отвергнут.
+        let snap = TunnelSnapshot {
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(
+            html.contains("занят другим туннельным адаптером"),
+            "получили: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_is_not_refused_when_liveness_is_merely_unknown() {
+        // Обратная сторона предыдущего теста: неизвестность НЕ должна
+        // блокировать так же, как обнаруженный чужой туннель, — иначе
+        // «честное “не знаю”» на странице было бы ложью, если сервер за
+        // кулисами всё равно отказывает.
+        let snap = TunnelSnapshot {
+            liveness_error: Some("тестовый отказ чтения лога".to_string()),
+            foreign_tunnel_up: true,
+            ..down_installed_snapshot()
+        };
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(snap),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(
+            !html.contains("подъём отменён"),
+            "неизвестность не обязана отменять подъём: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raising_the_tunnel_succeeds_and_reports_so() {
+        let (state, _rx) = state_with_tunnel(
+            app_state(3129, None),
+            Config::default(),
+            FakeTunnel::new(down_installed_snapshot()),
+        );
+        let html = handle_post(&state, b"action=raise_tunnel").await;
+        assert!(!html.contains("class=\"note bad\""), "получили: {html}");
+    }
+
+    // ---- Задача 3: раздел «Обновления» ----
+
+    #[test]
+    fn a_network_failure_is_never_worded_as_up_to_date() {
+        // Приёмка задачи буквально: отказ проверки не должен читаться как
+        // «вы в курсе последней версии».
+        let (bad, text) = update_status_text(&Some(CheckOutcome::Failed(
+            "тестовый отказ сети".to_string(),
+        )));
+        assert!(bad, "отказ обязан быть помечен как плохая новость");
+        assert!(!text.contains("последняя версия"), "получили: {text}");
+        assert_ne!(
+            update_status_text(&Some(CheckOutcome::Failed("x".to_string()))).1,
+            update_status_text(&Some(CheckOutcome::UpToDate)).1,
+            "текст отказа не должен совпасть с текстом «всё в порядке»"
+        );
+    }
+
+    #[test]
+    fn never_checked_is_worded_differently_from_up_to_date_and_from_failed() {
+        let (never_bad, never_text) = update_status_text(&None);
+        let (_, up_to_date_text) = update_status_text(&Some(CheckOutcome::UpToDate));
+        assert!(!never_bad, "«ещё не проверялось» — не плохая новость");
+        assert_ne!(never_text, up_to_date_text);
+    }
+
+    #[test]
+    fn a_refused_unsigned_update_says_plainly_that_nothing_installed() {
+        let (bad, text) = update_status_text(&Some(CheckOutcome::RefusedUnsigned {
+            tag: "v9.9.9".to_string(),
+            reason: "тестовый отказ подписи".to_string(),
+        }));
+        assert!(bad);
+        assert!(text.contains("НЕ установлено"), "получили: {text}");
+        assert!(text.contains("v9.9.9"), "получили: {text}");
+    }
+
+    #[test]
+    fn a_staged_update_is_reported_as_pending_the_next_launch() {
+        let (bad, text) = update_status_text(&Some(CheckOutcome::StagedForNextLaunch {
+            tag: "v9.9.9".to_string(),
+        }));
+        assert!(!bad);
+        assert!(text.contains("следующем запуске"), "получили: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_updates_section_reflects_the_toggle_and_the_last_status() {
+        let cfg = Config {
+            check_for_updates: false,
+            ..Config::default()
+        };
+        let (state, _rx) = state_with(app_state(3129, None), cfg);
+        state
+            .update_status
+            .store(Arc::new(Some(CheckOutcome::UpToDate)));
+        let html = render(&state, None);
+        assert!(
+            html.contains("id=\"check_for_updates\"")
+                || html.contains("name=\"check_for_updates\""),
+            "нет тумблера проверки обновлений: {html}"
+        );
+        // Выключенный тумблер не должен нести атрибут checked.
+        let toggle = html
+            .split("name=\"check_for_updates\"")
+            .nth(1)
+            .unwrap_or_default();
+        let before_closing_tag = &toggle[..toggle.find('>').unwrap_or(0)];
+        assert!(
+            !before_closing_tag.contains("checked"),
+            "тумблер обязан быть снят: {before_closing_tag}"
+        );
+        assert!(
+            html.contains("установлена последняя версия"),
+            "статус последней проверки не показан: {html}"
+        );
     }
 }

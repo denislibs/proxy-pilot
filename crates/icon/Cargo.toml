@@ -1,0 +1,12 @@
+[package]
+name = "proxypilot-icon"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# Ни одной зависимости: это чистая математика растеризации, нужная в двух
+# местах — трею (`crates/app/src/icons.rs`, во время выполнения) и сборке
+# exe (`crates/app/build.rs`, генерация .ico). Общий крейт — единственный
+# способ не завести вторую, рисованную вручную картинку для ресурсов exe,
+# которая разойдётся с тем, что показывает трей.
+[dependencies]

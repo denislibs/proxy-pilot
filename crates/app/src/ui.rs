@@ -70,3 +70,43 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         Err(format!("ShellExecuteW вернула {code}"))
     }
 }
+
+/// Запускает `exe` заново с параметрами `args` и запросом повышения прав —
+/// `ShellExecuteW` c `lpOperation = "runas"`, тем самым Windows сама
+/// показывает диалог UAC.
+///
+/// Единственный вызывающий во всём продукте (задача 7) — кнопка
+/// «Установить службу статического IP» на странице настроек
+/// (`settings_page::Tunnel::install_service`): `install-service` остаётся
+/// единственным запросом прав во всём приложении (`CLAUDE.md`, «Права
+/// администратора»), эта функция лишь даёт до него дотянуться из уже
+/// работающего (не повышенного) процесса, а не только из ручного запуска в
+/// консоли администратором.
+///
+/// `Ok` значит только «запрос дошёл до `ShellExecuteW`, и она вернула код
+/// успеха» — не «UAC принят» и не «служба установлена»: пользователь может
+/// отклонить диалог, и узнать об этом отсюда нельзя (тот же контракт, что у
+/// `open_in_browser` выше и у `openvpn::connect` в `winnet`).
+pub fn request_elevation(exe: &std::path::Path, args: &str) -> Result<(), String> {
+    let exe = HSTRING::from(exe.as_os_str());
+    let args = HSTRING::from(args);
+    // SAFETY: обе строки живы до конца вызова; окна-владельца нет намеренно
+    // — тот же случай, что и в `open_in_browser`. `lpOperation = "runas"` —
+    // то, что просит у Windows диалог согласия на повышение прав.
+    let code = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            w!("runas"),
+            &exe,
+            &args,
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = code.0 as usize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW (runas) вернула {code}"))
+    }
+}

@@ -14,6 +14,11 @@ path = "src/main.rs"
 proxypilot-core = { path = "../core" }
 proxypilot-bridge = { path = "../bridge" }
 proxypilot-winnet = { path = "../winnet" }
+proxypilot-icon = { path = "../icon" }
+# Только `install`/`uninstall` (регистрация в SCM) — команды
+# `install-service`/`uninstall-service` ниже в `main.rs`. Единственный
+# запрос UAC во всём продукте, вызывается не этой сессией.
+proxypilot-netsvc = { path = "../netsvc" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 arc-swap = { workspace = true }
@@ -23,6 +28,11 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     # Системный ГСЧ (`BCryptGenRandom`) для токена страницы настроек.
     "Win32_Security_Cryptography",
+    # Проверка подписи Authenticode скачанного обновления (`update::verify`,
+    # `WinVerifyTrust`) — системный API, есть на любой Windows, в отличие от
+    # `signtool.exe` (инструмент Windows SDK, которого на машине получателя
+    # нет).
+    "Win32_Security_WinTrust",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_DataExchange",
@@ -32,6 +42,10 @@ windows = { workspace = true, features = [
     # `ShellExecuteW` — открыть страницу настроек в браузере пользователя.
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # Скачивание релиза с GitHub (`update::source`) через системный
+    # HTTPS-клиент Windows: TLS достаётся бесплатно от системы, а не от
+    # нового звена в дереве зависимостей, которое придётся подписывать.
+    "Win32_Networking_WinHttp",
 ] }
 
 # Только для теста WinAutostart в main.rs, который трогает реальный Run:
@@ -42,3 +56,15 @@ windows = { workspace = true, features = [
 # продакшн-бинарника, поэтому в нём этих функций не будет вовсе.
 [dev-dependencies]
 proxypilot-winnet = { path = "../winnet", features = ["test-registry"] }
+# Только для tests/version_resource.rs: GetFileVersionInfoW/VerQueryValueW,
+# которыми тест читает VS_FIXEDFILEINFO уже собранного exe. Отдельно от
+# фич windows выше — в продакшн-бинарник (только [dependencies]) это не
+# попадает.
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+# build.rs генерирует .ico из того же кода, что рисует иконки трея
+# (`proxypilot-icon`), и вшивает его вместе с версией/метаданными в exe.
+[build-dependencies]
+proxypilot-icon = { path = "../icon" }
+winres = "0.1"
+ico = "0.5"

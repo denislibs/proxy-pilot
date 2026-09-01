@@ -626,7 +626,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
-    use crate::settings_page::AutostartPending;
+    use crate::settings_page::{AutostartPending, TunnelPending};
     use crate::Cmd;
 
     /// Порт «моста» по умолчанию. Не 8080 из вежливости, а чтобы страница
@@ -703,6 +703,8 @@ mod tests {
                 commands: tx,
                 bound_port,
                 autostart: Arc::new(AutostartPending),
+                tunnel: Arc::new(TunnelPending),
+                update_status: Arc::new(ArcSwap::from_pointee(None)),
             }),
             applied,
         )

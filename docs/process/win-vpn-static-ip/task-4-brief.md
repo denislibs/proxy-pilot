@@ -1,6 +1,6 @@
 # Task 4 — Управление туннелем
 
-**Files:** `win/crates/winnet/src/openvpn.rs` (**дописать**, не переписывая `find_installation` из задачи 1)
+**Files:** `crates/winnet/src/openvpn.rs` (**дописать**, не переписывая `find_installation` из задачи 1)
 
 **Produces:**
 ```rust

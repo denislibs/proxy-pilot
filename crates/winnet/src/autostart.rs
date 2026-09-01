@@ -71,8 +71,9 @@
 //!
 //! Обёртка над `HKEY` — `sysproxy::RegKey`, а не своя копия: единственное,
 //! что было жёстко привязано к `Internet Settings`, — подключ в `open()`, и
-//! он вынесен параметром именно ради этого второго потребителя (см. докблок
-//! `sysproxy::RegKey`).
+//! он вынесен параметром именно ради этого второго потребителя. Корень же
+//! (`HKEY_CURRENT_USER`) стал параметром позже, ради третьего потребителя —
+//! `openvpn`, читающего `HKEY_LOCAL_MACHINE` (см. докблок `sysproxy::RegKey`).
 
 use std::env;
 use std::fs;
@@ -82,7 +83,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 #[cfg(feature = "test-registry")]
 use windows::Win32::System::Registry::REG_VALUE_TYPE;
-use windows::Win32::System::Registry::{KEY_READ, KEY_WRITE};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 use crate::sysproxy::RegKey;
 use crate::WinNetError;
@@ -274,7 +275,17 @@ fn points_at(raw: &str, exe: &Path) -> bool {
 /// которым нужен настоящий реестр, но не настоящий `Run`. Продакшн видит
 /// только `is_enabled()` ниже, зашитую на `SUBKEY`.
 fn is_enabled_at(subkey: PCWSTR, exe: &Path) -> Result<bool, WinNetError> {
-    let key = RegKey::open(subkey, KEY_READ)?;
+    // `HKCU\...\Run` не гарантированно существует: на свежем профиле,
+    // где автозапуск не включали ни для одной программы, этого подключа
+    // попросту нет (найдено CI на `windows-latest` — не у каждого образа он
+    // есть). Отсутствие ключа значит «нет ни одной записи автозапуска», а
+    // значит и нашей — это `false`, такой же честный ответ, как и то, что
+    // `query_string` уже отдаёт для отсутствующего ЗНАЧЕНИЯ внутри
+    // существующего ключа. Любая другая ошибка (нет прав, битый куст)
+    // по-прежнему пробрасывается наружу через `open_if_exists`.
+    let Some(key) = RegKey::open_if_exists(HKEY_CURRENT_USER, subkey, KEY_READ)? else {
+        return Ok(false);
+    };
     let raw = key.query_string(VALUE_NAME)?;
     Ok(points_at(&expand_env(&raw), exe))
 }
@@ -295,7 +306,12 @@ pub fn is_enabled() -> Result<bool, WinNetError> {
 }
 
 fn enable_at(subkey: PCWSTR, exe: &Path) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    // `open_or_create`, не `open`: на свежем профиле, где ключ `Run` ещё
+    // никогда не создавался (см. докблок `is_enabled_at` выше), включение
+    // автозапуска обязано само завести ключ — так же, как это делает
+    // Windows при первой ручной записи в `Run`, — а не отказывать там, где
+    // до сих пор просто никто не писал.
+    let key = RegKey::open_or_create(HKEY_CURRENT_USER, subkey, KEY_WRITE)?;
     key.set_string(VALUE_NAME, &quote(exe))
 }
 
@@ -309,12 +325,19 @@ pub fn enable(exe: &Path) -> Result<(), WinNetError> {
 }
 
 fn disable_at(subkey: PCWSTR) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    // Отсутствие ключа `Run` — то же самое «автозапуска нет», что и
+    // отсутствие в нём значения `ProxyPilot`: docblock `disable` ниже
+    // обещает идемпотентность для второго случая, и первый ничем не хуже —
+    // выключать нечего в обоих. `open_if_exists`, как и в `is_enabled_at`.
+    let Some(key) = RegKey::open_if_exists(HKEY_CURRENT_USER, subkey, KEY_WRITE)? else {
+        return Ok(());
+    };
     key.delete_value(VALUE_NAME)
 }
 
 /// Выключает автозапуск: удаляет значение `ProxyPilot`. Идемпотентно —
-/// повторный вызов, как и вызов при уже выключенном автозапуске, не ошибка.
+/// повторный вызов, как и вызов при уже выключенном автозапуске (в том
+/// числе когда `HKCU\...\Run` целиком ещё не создан), не ошибка.
 pub fn disable() -> Result<(), WinNetError> {
     disable_at(SUBKEY)
 }
@@ -372,7 +395,7 @@ pub fn restore_raw_value_for_tests(previous: &str, value_type: u32) -> Result<()
 /// вызывающих под фичей.
 #[cfg(feature = "test-registry")]
 fn raw_value_at(subkey: PCWSTR) -> Result<(String, u32), WinNetError> {
-    let key = RegKey::open(subkey, KEY_READ)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_READ)?;
     Ok(match key.query_string_with_type(VALUE_NAME)? {
         Some((ty, value)) => (value, ty.0),
         None => (String::new(), 0),
@@ -385,7 +408,7 @@ fn restore_raw_value_at(
     previous: &str,
     value_type: u32,
 ) -> Result<(), WinNetError> {
-    let key = RegKey::open(subkey, KEY_WRITE)?;
+    let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)?;
     if previous.is_empty() {
         key.delete_value(VALUE_NAME)
     } else {
@@ -910,6 +933,128 @@ mod tests {
         );
     }
 
+    /// Как `TestSubkeyGuard`, но НЕ создаёт подключ при входе — нужен
+    /// тестам missing-key пути (найдено CI: `HKCU\...\Run` не гарантированно
+    /// существует), которым требуется имя заведомо ОТСУТСТВУЮЩЕГО подключа,
+    /// а не готовая песочница. `Drop` всё равно пытается удалить его: если
+    /// тестируемый код сам создал подключ (`enable_at`), убрать его нужно
+    /// так же, как обычную песочницу; если не создал (тест только читал или
+    /// удалял отсутствующий ключ) — `RegDeleteKeyW` вернёт
+    /// `ERROR_FILE_NOT_FOUND`, что и так молча игнорируется, как и в
+    /// `TestSubkeyGuard` выше.
+    ///
+    /// PID в имени по той же причине, что и у `TestSubkeyGuard` (fix round
+    /// 3, Minor 3) — параллельные прогоны `cargo test` не должны делить
+    /// один и тот же подключ; `label` вдобавок различает подключи НЕСКОЛЬКИХ
+    /// тестов внутри одного и того же процесса теста.
+    struct AbsentSubkeyGuard {
+        subkey_utf16: Vec<u16>,
+    }
+
+    impl AbsentSubkeyGuard {
+        fn new(label: &str) -> Self {
+            let name = format!(
+                "Software\\ProxyPilotAutostartSelfTest-{label}-{}",
+                std::process::id()
+            );
+            let subkey_utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            Self { subkey_utf16 }
+        }
+
+        fn subkey(&self) -> PCWSTR {
+            PCWSTR::from_raw(self.subkey_utf16.as_ptr())
+        }
+    }
+
+    impl Drop for AbsentSubkeyGuard {
+        fn drop(&mut self) {
+            // SAFETY: HKEY_CURRENT_USER — предопределённый корень;
+            // `self.subkey_utf16` — поле этого же значения, живо до конца
+            // `drop`. Ошибку игнорируем сознательно — как и в `Drop` для
+            // `TestSubkeyGuard` выше, и по той же причине: ключа могло не
+            // быть создано вовсе, и это ожидаемо, не отказ уборки.
+            let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, self.subkey()) };
+        }
+    }
+
+    #[test]
+    fn is_enabled_at_is_ok_false_when_the_registry_key_itself_is_missing() {
+        // Находка CI на windows-latest: `HKCU\...\Run` не гарантированно
+        // существует на свежем профиле — `RegKey::open` возвращала бы
+        // ошибку открытия, и `is_enabled_at` пробрасывала бы её наружу
+        // (панику видел `WinAutostart::is_enabled` в `crates/app/src/main.rs`)
+        // там, где честный ответ — «нет ни одной записи автозапуска, значит
+        // и нашей нет» — то же самое `Ok(false)`, что уже даёт отсутствие
+        // ЗНАЧЕНИЯ внутри существующего ключа.
+        let guard = AbsentSubkeyGuard::new("is-enabled-missing");
+        let exe = env::current_exe().expect("тестовый бинарник обязан резолвиться в путь");
+        assert!(!is_enabled_at(guard.subkey(), &exe)
+            .expect("отсутствие ключа обязано быть Ok(false), не ошибкой"));
+    }
+
+    #[test]
+    fn enable_at_creates_the_missing_registry_key_and_writes_the_value() {
+        // Самая заметная из трёх находок этого раунда: без `open_or_create`
+        // включить автозапуск на свежем профиле было нельзя вообще никак —
+        // `enable_at` валилась бы там, где сама Windows просто заводит
+        // `Run` при первой записи в него.
+        let guard = AbsentSubkeyGuard::new("enable-creates");
+        let exe = env::current_exe().expect("тестовый бинарник обязан резолвиться в путь");
+
+        enable_at(guard.subkey(), &exe)
+            .expect("enable_at обязан создать отсутствующий подключ и записать значение");
+        assert!(
+            is_enabled_at(guard.subkey(), &exe).expect("is_enabled_at обязан читаться"),
+            "после enable_at на свежесозданном подключе тумблер обязан показывать «включено»"
+        );
+    }
+
+    #[test]
+    fn disable_at_is_ok_when_the_registry_key_itself_is_missing() {
+        // Docblock `disable` обещает идемпотентность и для случая «уже
+        // выключено» — отсутствие подключа `Run` целиком является ровно
+        // этим случаем, а не поводом для ошибки.
+        let guard = AbsentSubkeyGuard::new("disable-missing");
+        assert!(
+            disable_at(guard.subkey()).is_ok(),
+            "отсутствие ключа обязано быть Ok(()), не ошибкой"
+        );
+    }
+
+    #[test]
+    fn is_enabled_at_surfaces_a_non_missing_key_error_instead_of_treating_it_as_false() {
+        // Обратная сторона трёх тестов выше: различать «ключа нет»
+        // (`ERROR_FILE_NOT_FOUND`, честное «выключено») обязаны именно от
+        // этого конкретного кода ошибки, а не от любой ошибки открытия —
+        // иначе, скажем, отказ в доступе или битый куст стали бы
+        // неотличимы от «автозапуска нет»: тихая ложь вместо громкой
+        // ошибки, ровно то, чего это исправление обязано избежать.
+        //
+        // Имя подключа длиннее 255 символов (предел одного компонента пути
+        // реестра, `MAX_KEY_LENGTH`) Windows отвергает при разборе имени —
+        // заведомо не тем же кодом, что и «подключа с таким именем нет».
+        let subkey_name = format!("Software\\{}", "x".repeat(300));
+        let subkey_utf16: Vec<u16> = subkey_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let subkey = PCWSTR::from_raw(subkey_utf16.as_ptr());
+        let exe = env::current_exe().expect("тестовый бинарник обязан резолвиться в путь");
+
+        let err = is_enabled_at(subkey, &exe)
+            .expect_err("слишком длинное имя подключа обязано быть ошибкой, а не Ok(false)");
+        match err {
+            WinNetError::Windows(e) => assert_ne!(
+                e.code(),
+                windows::core::HRESULT::from_win32(
+                    windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0
+                ),
+                "тест обязан бить не в отсутствие ключа, а в другую ошибку: {e}"
+            ),
+            other => panic!("ожидалась WinNetError::Windows, получили: {other}"),
+        }
+    }
+
     #[test]
     fn restore_raw_value_preserves_the_original_reg_expand_sz_type() {
         // Находка round 4, Minor 4: раньше восстановление писало через
@@ -920,14 +1065,16 @@ mod tests {
         let guard = TestSubkeyGuard::new();
         let subkey = guard.subkey();
 
-        let key = RegKey::open(subkey, KEY_WRITE).expect("подключ обязан открываться на запись");
+        let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_WRITE)
+            .expect("подключ обязан открываться на запись");
         key.set_string_as(VALUE_NAME, r"%SystemRoot%\explorer.exe", REG_EXPAND_SZ)
             .expect("исходное REG_EXPAND_SZ-значение обязано писаться");
 
         let (value, value_type) = raw_value_at(subkey).expect("чтение обязано пройти");
         restore_raw_value_at(subkey, &value, value_type).expect("восстановление обязано пройти");
 
-        let key = RegKey::open(subkey, KEY_READ).expect("подключ обязан открываться на чтение");
+        let key = RegKey::open(HKEY_CURRENT_USER, subkey, KEY_READ)
+            .expect("подключ обязан открываться на чтение");
         let (restored_type, restored_value) = key
             .query_string_with_type(VALUE_NAME)
             .expect("чтение обязано пройти")

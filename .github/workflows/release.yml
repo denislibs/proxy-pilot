@@ -1,0 +1,179 @@
+name: Release
+
+# Отдельный файл, а не условие внутри job'ов `check`/`msrv` конвейера
+# `ci.yml`. `ci.yml` реагирует на push в любую ветку и на pull request —
+# у публикации релиза не может быть того же триггера, иначе обычный push
+# в фиче-ветку получает шанс опубликовать релиз при любой ошибке в
+# условии. Триггер здесь — только пуш тега `v*`; на push в ветку (в том
+# числе default) этот workflow не запускается вовсе, потому что `on.push`
+# ограничен полем `tags`, а не веткой.
+on:
+  push:
+    tags:
+      - "v*"
+
+# GITHUB_TOKEN по умолчанию даёт только чтение на многих репозиториях;
+# создание релиза и загрузка в него файлов требуют записи явно.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Сборка, подпись и публикация релиза
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Тег и версия в манифесте (`workspace.package.version`, задача 1) —
+      # два независимых источника истины, и ничто не мешает им разойтись:
+      # тег можно поставить до правки Cargo.toml, забыть про bump версии
+      # или опечататься в самом теге. Расхождение ловится здесь и роняет
+      # job ДО подписи и публикации — релиз, уехавший с чужим номером
+      # внутри, потом невозможно отследить: у получателя в свойствах файла
+      # (задача 1) одно, в имени релиза другое.
+      #
+      # Версия читается через `cargo metadata`, а не регэкспом по
+      # Cargo.toml: это то же самое разрешение workspace-манифеста, которым
+      # пользуется сам cargo при сборке (member-крейты объявляют
+      # `version.workspace = true`), а не вторая, независимая реализация
+      # парсинга TOML, которая может разойтись с настоящей.
+      - name: Тег соответствует версии манифеста
+        id: version-check
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $tagVersion = $tag -replace '^v', ''
+
+          $metadata = cargo metadata --no-deps --format-version=1 | ConvertFrom-Json
+          $crateVersion = ($metadata.packages | Where-Object { $_.name -eq 'proxypilot-app' }).version
+
+          if ($tagVersion -ne $crateVersion) {
+            Write-Output "::error title=Тег не совпадает с версией манифеста::Тег '$tag' (версия '$tagVersion') не совпадает с workspace.package.version в манифесте ('$crateVersion'). Поправьте Cargo.toml или пересоздайте тег — сборка остановлена до подписи и публикации."
+            exit 1
+          }
+          Write-Output "Тег '$tag' совпадает с версией манифеста ('$crateVersion')."
+
+      - name: Сборка релиза
+        run: cargo build --release -p proxypilot-bridge -p proxypilot-app
+
+      # Если сборка почему-то не оставила один из бинарей (сломанный
+      # фильтр `-p`, переименованный таргет) — сказать об этом явно
+      # аннотацией `::error::` здесь, а не молча упасть на шаге подписи
+      # с малопонятной ошибкой «файл не найден». Аннотации читаются через
+      # API без авторизации, логи Actions — нет, даже у публичного
+      # репозитория (см. `ci.yml` и `progress.md` про этот же приём).
+      - name: Проверка наличия собранных бинарей
+        shell: pwsh
+        run: |
+          $targets = @(
+            "target\release\proxypilot.exe",
+            "target\release\proxypilot-bridge.exe"
+          )
+          $missing = $targets | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            Write-Output "::error title=Не хватает собранных бинарей::$($missing -join ', ') — сборка релиза не произвела ожидаемые файлы."
+            exit 1
+          }
+
+      # Дословно та же логика, что и шаг «Подпись Authenticode» в
+      # ci.yml (задача 2): нет секрета — предупреждение и unsigned-релиз
+      # (ожидаемо, пока сертификат не куплен, см.
+      # docs/process/win-delivery/task-2-brief.md); секрет наполовину
+      # задан — падение (это не «сертификата нет», а сломанная настройка);
+      # оба секрета заданы — подпись с RFC 3161 отметкой времени, чтобы
+      # подпись пережила истечение сертификата.
+      #
+      # Логика продублирована из ci.yml, а не вынесена в общий
+      # composite-action. ci.yml прошёл реальный прогон на windows-latest
+      # (задача 2); у release.yml такой проверки нет и не может быть до
+      # первого настоящего тега — превращать проверенный шаг в общий код
+      # ради этой задачи означает менять то, что уже подтверждено рабочим,
+      # без возможности перепроверить результат реальным прогоном. Если
+      # signtool-логика изменится, поправить придётся в обоих файлах —
+      # сознательный компромисс, а не недосмотр (см. отчёт по задаче).
+      - name: Подпись Authenticode
+        id: sign
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_BASE64)) {
+            Write-Output "::warning::Секрет WINDOWS_CERTIFICATE_BASE64 не задан — .exe в этом релизе НЕ подписаны Authenticode. Это ожидаемо, пока сертификат не куплен (см. docs/process/win-delivery/task-2-brief.md). Получатели один раз увидят предупреждение SmartScreen. Когда сертификат появится, добавьте секреты WINDOWS_CERTIFICATE_BASE64 и WINDOWS_CERTIFICATE_PASSWORD — править этот workflow не понадобится."
+            echo "signed=false" >> $env:GITHUB_OUTPUT
+          } elseif ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            # Сертификат задан, а пароль — нет: это не «сертификата пока
+            # нет», а сломанная настройка секретов, и её надо уронить, а не
+            # молча пропустить как первый случай.
+            throw "WINDOWS_CERTIFICATE_BASE64 задан, а WINDOWS_CERTIFICATE_PASSWORD — нет. Это не отсутствие сертификата, а неполная настройка секретов."
+          } else {
+            $certPath = Join-Path $env:RUNNER_TEMP "proxypilot-codesign.pfx"
+            [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+
+            # signtool не гарантированно есть в PATH на образе windows-latest —
+            # ищем его там, где реально лежит поставленный на образ Windows SDK.
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction Stop |
+              Where-Object { $_.FullName -like "*\x64\*" } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signtool) {
+              throw "signtool.exe не найден под Windows Kits — образ раннера изменился, путь поиска надо пересмотреть."
+            }
+            Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $signtool)
+
+            $targets = @(
+              "target\release\proxypilot.exe",
+              "target\release\proxypilot-bridge.exe"
+            )
+            foreach ($exe in $targets) {
+              # /tr + /td sha256 — отметка времени RFC 3161: подпись
+              # переживёт истечение сертификата, а не протухнет вместе с ним.
+              & $signtool sign /fd sha256 /f $certPath /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr http://timestamp.digicert.com /td sha256 $exe
+              if ($LASTEXITCODE -ne 0) {
+                throw "signtool sign упал на $exe (код $LASTEXITCODE)"
+              }
+            }
+
+            Remove-Item $certPath -Force
+            echo "signed=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Проверка подписи
+        # Выполняется, только если подпись реально была: без сертификата
+        # проверять нечего, а падать на отсутствии подписи здесь нельзя —
+        # неподписанный релиз хоть и с предупреждением SmartScreen, но
+        # это ожидаемый и единственный путь публикации до появления
+        # сертификата (см. шаг «Подпись Authenticode» выше).
+        if: steps.sign.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          # Подписать и не проверить — узнать о проблеме от получателя.
+          foreach ($exe in @("target\release\proxypilot.exe", "target\release\proxypilot-bridge.exe")) {
+            & signtool verify /pa /v $exe
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify не подтвердил подпись на $exe"
+            }
+          }
+
+      # `proxypilot-bridge.exe` — тот же мост без UI, полезен из консоли;
+      # он уже собран и подписан в этом же прогоне (шаги выше строят и
+      # подписывают оба бинаря разом), так что приложить его к релизу
+      # вместе с `proxypilot.exe` не стоит ничего лишнего — второй сборки
+      # или второй подписи не требуется.
+      - name: Публикация релиза
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "target\release\proxypilot.exe" `
+            "target\release\proxypilot-bridge.exe" `
+            --title $env:GITHUB_REF_NAME `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=Публикация релиза не удалась::gh release create вернул код $LASTEXITCODE для тега $env:GITHUB_REF_NAME — смотрите лог шага выше."
+            exit 1
+          }
+          Write-Output "Релиз $env:GITHUB_REF_NAME опубликован."
