@@ -1744,3 +1744,176 @@ HKCU\Software: 71 подключ, ни одного ProxyPilot*.
 - **Есть ли хоть один `#[allow(...)]` среди новых clippy-фиксов?** Нет — все четыре исправлены по существу.
 - **Остаются ли тесты `bypass`/`config` внутри `192.168.0.0/16` после замены адреса?** Да — `192.168.1.246`, `192.168.1.247`, `192.168.1.1` все внутри диапазона.
 - **Остался ли `sysproxy.rs`'s регион `mod tests` побайтово идентичным?** Да — `diff` пуст (см. выше); 9 тестов зелёные.
+
+## Fix round 6 (найдено CI, не ревью — `HKCU\...\Run` не гарантированно существует)
+
+Не ревью, а красный CI на `windows-latest`: 9 из 16 прогонов подряд падали
+`process completed with exit code 1` без единого имени теста — GitHub Actions
+логи требуют авторизации даже у публичного репозитория. Первым шагом workflow
+(`.github/workflows/ci.yml`, шаг «Тесты») был переделан так, чтобы упавшие
+тесты назывались через `::error::` — это попадает в аннотации прогона, а они
+читаются через API без авторизации. Следующий же красный прогон назвал тест:
+
+```
+test tests::win_autostart_is_enabled_does_not_fail ... FAILED
+panicked at crates\app\src\main.rs:1454
+```
+
+### Диагноз
+
+`autostart::is_enabled_at` (`crates/winnet/src/autostart.rs`) открывала
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` через `RegKey::open`,
+которая пробрасывает ошибку Windows, если подключа нет. Но этот подключ **не
+гарантирован**: он существует только после того, как что-то в системе хоть
+раз написало в него автозапуск. Свежий профиль пользователя (ровно то, чем
+отличаются образы раннеров GitHub между прогонами) может его не иметь вовсе —
+это и было источником «интермиттентности», а не флакующим тестом.
+
+Находка касалась трёх функций, не одной:
+
+1. **`is_enabled_at`** — отсутствие ключа пробрасывалось как `Err`, хотя это
+   такой же честный ответ «выключено», как и уже обрабатываемое отсутствие
+   значения внутри существующего ключа.
+2. **`enable_at`** (самая заметная находка — её не поймал ни один
+   существовавший тест) — открывала ключ только на запись (`RegKey::open`,
+   `KEY_WRITE`), которая тоже отказывает, если ключа нет. На свежем профиле
+   включить автозапуск было нельзя **никаким способом через интерфейс** —
+   ни разу, ни один пользователь такого профиля.
+3. **`disable_at`** — тот же отказ там, где собственный докблок `disable`
+   обещает идемпотентность («повторный вызов, как и вызов при уже выключенном
+   автозапуске, не ошибка») — отсутствие ключа целиком это то же самое
+   состояние, что докблок уже обещал покрывать.
+
+### Исправление
+
+Новый код не трогает ничего в существующих `RegKey::open`/`apply`/`read` —
+`sysproxy.rs`'s регион `mod tests` остался побайтово идентичным (`diff` пуст,
+9 тестов не изменились ни строкой), `apply()` по-прежнему пишет
+ProxyServer → ProxyOverride → ProxyEnable последним. Добавлены два новых
+метода `RegKey` в `crates/winnet/src/sysproxy.rs`:
+
+- `open_if_exists(root, subkey, access) -> Result<Option<Self>, WinNetError>`
+  — как `open`, но `Ok(None)`, если подключа нет; любая другая ошибка (нет
+  прав, битый куст) пробрасывается как есть, не маскируется под «нет ключа».
+  Использует тот же приём, что уже был в `openvpn::open_key` (сравнение кода
+  ошибки с `ERROR_FILE_NOT_FOUND` через `HRESULT::from_win32`), просто
+  вынесенный в саму обёртку ради переиспользования сразу двумя вызывающими.
+- `open_or_create(root, subkey, access) -> Result<Self, WinNetError>` — как
+  `open`, но через `RegCreateKeyExW` вместо `RegOpenKeyExW`: создаёт подключ,
+  если его нет, вместо отказа.
+
+`crates/winnet/src/autostart.rs`:
+
+- `is_enabled_at` теперь зовёт `open_if_exists(..., KEY_READ)`; `None` →
+  `Ok(false)`.
+- `enable_at` теперь зовёт `open_or_create(..., KEY_WRITE)` вместо `open`.
+- `disable_at` теперь зовёт `open_if_exists(..., KEY_WRITE)`; `None` →
+  `Ok(())`. Докблок `disable` уточнён: идемпотентность явно распространена
+  и на случай отсутствующего `Run` целиком.
+
+### Тесты
+
+Четыре новых теста в `crates/winnet/src/autostart.rs`, против одноразового
+подключа-песочницы с суффиксом PID (`AbsentSubkeyGuard` — тот же приём, что
+и у существующего `TestSubkeyGuard`, но без создания ключа при входе; `Drop`
+всё равно пытается удалить, на случай если тестируемый код его создал):
+
+- `is_enabled_at_is_ok_false_when_the_registry_key_itself_is_missing` —
+  заведомо отсутствующий подключ → `Ok(false)`, не ошибка.
+- `enable_at_creates_the_missing_registry_key_and_writes_the_value` —
+  `enable_at` на отсутствующем подключе создаёт его и пишет значение;
+  проверено round-trip через `is_enabled_at`.
+- `disable_at_is_ok_when_the_registry_key_itself_is_missing` — заведомо
+  отсутствующий подключ → `Ok(())`.
+- `is_enabled_at_surfaces_a_non_missing_key_error_instead_of_treating_it_as_false`
+  — подключ с именем длиннее 255 символов (предел одного компонента пути
+  реестра) даёт Windows-ошибку, заведомо отличную от `ERROR_FILE_NOT_FOUND`
+  (проверено явным `assert_ne!` на коде ошибки внутри теста); эта ошибка
+  обязана остаться `Err`, а не тихо стать `Ok(false)` — без этого теста
+  правка выше могла бы случайно превратиться в «любая ошибка → выключено» и
+  спрятать реальный отказ (нет прав, битый куст) под честным на вид
+  ответом.
+
+Настоящий `HKCU\...\Run` этой машины не тронут ни одним из новых тестов —
+все работают против подключей `Software\ProxyPilotAutostartSelfTest-<label>-
+<pid>`, которых до и после прогона в реестре нет. Проверено count-ом значений
+в `Run` через `Get-Item ... | ValueCount` до и после: **10 и 10**, число не
+изменилось.
+
+### Прогон трёх команд CI
+
+Все три — на этой же ветке, с `CARGO_TARGET_DIR`, указывающим в отдельный
+каталог (не `target/`, где уже собран и запущен другой экземпляр
+`proxypilot.exe`, чтобы не задеть линковку работающего процесса).
+
+**`cargo fmt --all --check`** — пустой вывод, код выхода 0.
+
+**`cargo clippy --all-targets -- -D warnings`**
+
+```
+    Checking proxypilot-winnet v0.1.0 (...)
+    Checking proxypilot-netsvc v0.1.0 (...)
+    Checking proxypilot-app v0.1.0 (...)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.74s
+```
+
+Ноль предупреждений, код выхода 0.
+
+**`cargo test --all`** — хвост:
+
+```
+test result: ok. 145 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.60s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 158 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.14s
+```
+
+`proxypilot-winnet` — 158 passed (было 154 до этого раунда, +4 новых теста),
+0 failed, 2 ignored (оба — `#[ignore]`-тесты против настоящего `Run`,
+намеренно не гоняются автоматически). `tests::win_autostart_is_enabled_does_not_fail`
+(`crates/app/src/main.rs`) — тот самый тест, названный CI в аннотации, — в
+зелёной группе (`ok`).
+
+До правки, для контраста: тот же `cargo test --all` на этой же машине сейчас
+**тоже проходит** (154 passed в `proxypilot-winnet`, 0 failed) — потому что
+на этой машине `HKCU\...\Run` существует (10 записей). Это ожидаемо и
+согласуется с диагнозом: баг не флакует сам по себе, он детерминирован
+относительно состояния профиля, а не относительно чего-то во времени —
+воспроизвести его на машине с уже существующим `Run` нельзя было в принципе,
+только на профиле без него (какими и оказались часть образов
+`windows-latest`), поэтому воспроизведение здесь идёт через отдельный
+подключ-песочницу, который целенаправленно не создаётся, а не через попытку
+снести настоящий `Run`.
+
+### `openvpn`'s HKLM-чтение — проверено, тот же баг отсутствует
+
+`openvpn::open_key` (`crates/winnet/src/openvpn.rs`), открывающая
+`HKLM\SOFTWARE\OpenVPN`, уже отличает отсутствие подключа от прочих ошибок:
+
+```rust
+fn open_key(subkey: PCWSTR) -> Result<Option<RegKey>, WinNetError> {
+    match RegKey::open(HKEY_LOCAL_MACHINE, subkey, KEY_READ) {
+        Ok(key) => Ok(Some(key)),
+        Err(WinNetError::Windows(e)) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+Это ровно тот же приём, что теперь вынесен в `RegKey::open_if_exists`, и он
+уже был покрыт тестом (`open_key_is_none_for_a_subkey_that_does_not_exist`,
+проходит и в этом прогоне). Латентного бага здесь нет — `find_installation`
+и так трактует отсутствие ключа `OpenVPN` как «не установлен», что и есть
+корректный исход (докблок модуля: «Отсутствие OpenVPN — это `Ok(None)`, а не
+ошибка»). Правка `openvpn.rs` не потребовалась и не вносилась.
+
+### Коммит
+
+`fix(win): не падать, если HKCU\...\Run не существует` — три места
+(`is_enabled_at`, `enable_at`, `disable_at`), два новых метода `RegKey`
+(`open_if_exists`, `open_or_create`), четыре новых теста.

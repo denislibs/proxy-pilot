@@ -13,15 +13,15 @@
 //! читающие `HTTP_PROXY` из окружения. Это не недоделка, а граница: расширить
 //! её без UAC нельзя, поэтому UI обязан сказать об этом честно.
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HRESULT, PCWSTR};
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::Networking::WinInet::{
     InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ,
-    REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
 use crate::WinNetError;
@@ -115,6 +115,88 @@ impl RegKey {
         // заполняет только при успехе. Полученный хендл сразу переходит под
         // управление RegKey, чей Drop его закрывает.
         unsafe { RegOpenKeyExW(root, subkey, 0, access, &mut hkey) }.ok()?;
+        Ok(Self(hkey))
+    }
+
+    /// Как `open`, но отсутствие самого подключа — `Ok(None)`, а не ошибка.
+    ///
+    /// Нужен `autostart::is_enabled_at`/`disable_at`: `HKCU\...\Run` не
+    /// гарантированно существует (docblock `open` описывает контракт корней,
+    /// но не подключей) — на свежем профиле, где автозапуск никогда не
+    /// включали ни для одной программы, ключа попросту нет. Это состояние
+    /// «автозапуска нет» ничем не отличается от «ключ есть, а значения в нём
+    /// нет», которое `query_string`/`delete_value` уже трактуют как пустоту
+    /// — разница только в том, на каком уровне реестра не хватает записи.
+    ///
+    /// Тот же приём (сравнение кода ошибки с `ERROR_FILE_NOT_FOUND` через
+    /// HRESULT, а не любая ошибка → `None`) уже используют `openvpn::open_key`
+    /// и `query_raw`/`delete_value` ниже — здесь он даётся ещё раз, потому что
+    /// сравнение делается уже ПОСЛЕ преобразования `WIN32_ERROR` в
+    /// `windows_core::Error` (через `?` в `open`), а не до, как там: `open`
+    /// не годится трогать ради одного этого вызывающего, вынесенного отдельно
+    /// ради переиспользования сразу двумя местами `autostart`. Любая другая
+    /// ошибка (нет прав, битый куст) наружу пробрасывается как есть — не
+    /// маскируется под «ключа нет».
+    pub(crate) fn open_if_exists(
+        root: HKEY,
+        subkey: PCWSTR,
+        access: REG_SAM_FLAGS,
+    ) -> Result<Option<Self>, WinNetError> {
+        match Self::open(root, subkey, access) {
+            Ok(key) => Ok(Some(key)),
+            Err(WinNetError::Windows(e))
+                if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Как `open`, но создаёт подключ, если его ещё нет, вместо отказа.
+    ///
+    /// Нужен `autostart::enable_at`: включить автозапуск обязано получаться
+    /// и на свежем профиле, где `HKCU\...\Run` ещё никогда не создавался —
+    /// иначе первое включение автозапуска валилось бы там, где должно было
+    /// просто завести ключ, как это делает сама Windows при первой ручной
+    /// записи в `Run` через реестр или инсталлятор.
+    ///
+    /// `RegCreateKeyExW`, а не `RegOpenKeyExW` + отдельное создание: она уже
+    /// умеет и то, и другое одним вызовом — открывает существующий подключ
+    /// либо создаёт его, если нет (это и есть разница с `open`, которая умеет
+    /// только первое). `REG_OPTION_NON_VOLATILE` — тот же выбор, что и у
+    /// `Run` и `Internet Settings` целиком: ключ обязан пережить перезагрузку,
+    /// а не исчезнуть вместе с сессией.
+    pub(crate) fn open_or_create(
+        root: HKEY,
+        subkey: PCWSTR,
+        access: REG_SAM_FLAGS,
+    ) -> Result<Self, WinNetError> {
+        let mut hkey = HKEY::default();
+        // SAFETY: `root` — предопределённый корень (см. `open` выше), не
+        // нуждается в закрытии сам по себе; `subkey` обязан быть статической
+        // строкой с завершающим нулём — тот же контракт, что и у `open`;
+        // класс подключа не нужен — `PCWSTR::null()`; атрибуты безопасности
+        // не нужны — `None` (наследуются от родительского ключа, как и при
+        // обычном создании через `regedit`); диспозиция (создан/уже был)
+        // вызывающему не нужна — `None`; `phkresult` указывает на живую
+        // локальную переменную, которую API заполняет только при успехе.
+        // Полученный хендл сразу переходит под управление RegKey, чей Drop
+        // его закрывает — как и в `open`.
+        unsafe {
+            RegCreateKeyExW(
+                root,
+                subkey,
+                0,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                access,
+                None,
+                &mut hkey,
+                None,
+            )
+        }
+        .ok()?;
         Ok(Self(hkey))
     }
 
